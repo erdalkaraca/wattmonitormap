@@ -20,3 +20,18 @@ export const MUNICIPALITIES: Municipality[] = [
   { key: '03452002', name: 'Aurich',         lng:  7.5013, lat: 53.4700 },
   { key: '03462001', name: 'Wittmund',       lng:  7.7776, lat: 53.5771 },
 ];
+
+/**
+ * Default seed markers shown on startup.
+ * Focuses on larger municipalities in the northwest region.
+ */
+export const DEFAULT_MUNICIPALITY_KEYS = new Set<string>([
+  '03403000', // Oldenburg
+  '03405000', // Wilhelmshaven
+  '03402000', // Emden
+  '03401000', // Delmenhorst
+]);
+
+export const DEFAULT_MUNICIPALITIES: Municipality[] = MUNICIPALITIES.filter((m) =>
+  DEFAULT_MUNICIPALITY_KEYS.has(m.key)
+);

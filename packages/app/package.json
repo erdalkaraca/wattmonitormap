@@ -5,8 +5,11 @@
   "type": "module",
   "private": true,
   "scripts": {
+    "predev": "npm run ensure:municipality-boundaries -w extension-wattmonitor-map",
     "dev": "vite",
+    "prebuild": "npm run ensure:municipality-boundaries -w extension-wattmonitor-map",
     "build": "vite build",
+    "prepreview": "npm run ensure:municipality-boundaries -w extension-wattmonitor-map",
     "preview": "vite preview"
   },
   "dependencies": {

@@ -2,9 +2,10 @@ import { customElement, html, css, unsafeCSS, state } from '@eclipse-docks/core/
 import { DocksPart } from '@eclipse-docks/core';
 import maplibregl from 'maplibre-gl';
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css?inline';
-import { MUNICIPALITIES, type Municipality } from './municipalities.js';
+import { DEFAULT_MUNICIPALITIES, type Municipality } from './municipalities.js';
 import { USE_MOCK_DATA, loadingSignal, lastUpdateSignal, errorCountSignal } from './map-status.js';
 import countryBoundariesUrl from './countries.geojson?url';
+import stateBoundariesUrl from './state-boundaries.geojson?url';
 
 /** Shape of a single data point returned by /api/getdata */
 export interface WattMonitorDataPoint {
@@ -41,7 +42,38 @@ export interface WattMonitorDataPoint {
 const API_BASE = 'https://wattmonitor.ewe-netz.de';
 const REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 min
 
+const STATE_CODES = [
+  '01', '02', '03', '04', '05', '06', '07', '08',
+  '09', '10', '11', '12', '13', '14', '15', '16',
+] as const;
+
+const MUNICIPALITY_BOUNDARY_URLS: Record<string, string> = {
+  '01': new URL('./municipality-boundaries/01.geojson', import.meta.url).href,
+  '02': new URL('./municipality-boundaries/02.geojson', import.meta.url).href,
+  '03': new URL('./municipality-boundaries/03.geojson', import.meta.url).href,
+  '04': new URL('./municipality-boundaries/04.geojson', import.meta.url).href,
+  '05': new URL('./municipality-boundaries/05.geojson', import.meta.url).href,
+  '06': new URL('./municipality-boundaries/06.geojson', import.meta.url).href,
+  '07': new URL('./municipality-boundaries/07.geojson', import.meta.url).href,
+  '08': new URL('./municipality-boundaries/08.geojson', import.meta.url).href,
+  '09': new URL('./municipality-boundaries/09.geojson', import.meta.url).href,
+  '10': new URL('./municipality-boundaries/10.geojson', import.meta.url).href,
+  '11': new URL('./municipality-boundaries/11.geojson', import.meta.url).href,
+  '12': new URL('./municipality-boundaries/12.geojson', import.meta.url).href,
+  '13': new URL('./municipality-boundaries/13.geojson', import.meta.url).href,
+  '14': new URL('./municipality-boundaries/14.geojson', import.meta.url).href,
+  '15': new URL('./municipality-boundaries/15.geojson', import.meta.url).href,
+  '16': new URL('./municipality-boundaries/16.geojson', import.meta.url).href,
+};
+
+type FeatureCollection = {
+  type: 'FeatureCollection';
+  features: Array<{ properties?: Record<string, unknown> }>;
+};
+
 let countryBoundariesPromise: Promise<unknown> | undefined;
+let stateBoundariesPromise: Promise<FeatureCollection> | undefined;
+const municipalityBoundariesByStatePromise = new Map<string, Promise<FeatureCollection>>();
 
 function loadCountryBoundaries(): Promise<unknown> {
   if (!countryBoundariesPromise) {
@@ -53,6 +85,40 @@ function loadCountryBoundaries(): Promise<unknown> {
     });
   }
   return countryBoundariesPromise;
+}
+
+function loadStateBoundaries(): Promise<FeatureCollection> {
+  if (!stateBoundariesPromise) {
+    stateBoundariesPromise = fetch(stateBoundariesUrl).then(async (response) => {
+      if (!response.ok) {
+        throw new Error(`Failed to fetch state boundaries: HTTP ${response.status}`);
+      }
+      return response.json() as Promise<FeatureCollection>;
+    });
+  }
+  return stateBoundariesPromise;
+}
+
+function loadMunicipalityBoundariesForState(stateCode: string): Promise<FeatureCollection> {
+  const normalizedStateCode = stateCode.padStart(2, '0');
+  const existingPromise = municipalityBoundariesByStatePromise.get(normalizedStateCode);
+  if (existingPromise) {
+    return existingPromise;
+  }
+
+  const url = MUNICIPALITY_BOUNDARY_URLS[normalizedStateCode];
+  if (!url) {
+    return Promise.reject(new Error(`No municipality boundary URL configured for state ${normalizedStateCode}`));
+  }
+
+  const requestPromise = fetch(url).then(async (response) => {
+    if (!response.ok) {
+      throw new Error(`Failed to fetch municipality boundaries for state ${normalizedStateCode}: HTTP ${response.status}`);
+    }
+    return response.json() as Promise<FeatureCollection>;
+  });
+  municipalityBoundariesByStatePromise.set(normalizedStateCode, requestPromise);
+  return requestPromise;
 }
 
 /** Get the appropriate map style URL based on the current theme preference */
@@ -231,6 +297,90 @@ export class WattmonitorMapPart extends DocksPart {
   private _resizeObserver?: ResizeObserver;
   private _themeMutationObserver?: MutationObserver;
   private _data: Map<string, WattMonitorDataPoint> = new Map();
+  private _dynamicMunicipalities: Map<string, Municipality> = new Map();
+  private _loadedMunicipalityStates = new Set<string>();
+  private _municipalityBoundaryData: FeatureCollection = { type: 'FeatureCollection', features: [] };
+  private _municipalityHandlersBound = false;
+
+  private _allMunicipalities(): Municipality[] {
+    return [...DEFAULT_MUNICIPALITIES, ...this._dynamicMunicipalities.values()];
+  }
+
+  private _bindMunicipalityInteractionHandlers(): void {
+    if (!this._map || this._municipalityHandlersBound) {
+      return;
+    }
+
+    this._map.on('mouseenter', 'municipality-boundaries-fill', () => {
+      this._map!.getCanvas().style.cursor = 'pointer';
+    });
+    this._map.on('mouseleave', 'municipality-boundaries-fill', () => {
+      this._map!.getCanvas().style.cursor = '';
+    });
+
+    this._map.on('click', 'municipality-boundaries-fill', async (event) => {
+      const feature = event.features?.[0];
+      if (!feature?.properties) return;
+
+      const properties = feature.properties as Record<string, unknown>;
+      const key = String(properties.AGS ?? '').trim();
+      if (!key) return;
+      const name = String(properties.GEN ?? `AGS ${key}`);
+
+      if (!DEFAULT_MUNICIPALITIES.some((m) => m.key === key) && !this._dynamicMunicipalities.has(key)) {
+        this._dynamicMunicipalities.set(key, {
+          key,
+          name,
+          lng: event.lngLat.lng,
+          lat: event.lngLat.lat,
+        });
+      }
+
+      const target = this._allMunicipalities().find((m) => m.key === key);
+      if (!target) return;
+
+      try {
+        await this._fetchOne(target);
+        this._renderMarkers();
+      } catch (error) {
+        console.error(`Failed to load municipality data for ${key}:`, error);
+      }
+    });
+
+    this._municipalityHandlersBound = true;
+  }
+
+  private async _loadMunicipalityBoundariesForVisibleStates(): Promise<void> {
+    if (!this._map || !this._map.getLayer('state-boundaries-fill')) {
+      return;
+    }
+
+    const visibleStates = this._map.queryRenderedFeatures(undefined, { layers: ['state-boundaries-fill'] });
+    const statesToLoad = Array.from(new Set(
+      visibleStates
+        .map((feature) => String((feature.properties as Record<string, unknown> | undefined)?.SN_L ?? '').padStart(2, '0'))
+        .filter((stateCode) => STATE_CODES.includes(stateCode as (typeof STATE_CODES)[number]))
+    )).filter((stateCode) => !this._loadedMunicipalityStates.has(stateCode));
+
+    if (statesToLoad.length === 0) {
+      return;
+    }
+
+    const results = await Promise.allSettled(statesToLoad.map((stateCode) => loadMunicipalityBoundariesForState(stateCode)));
+    for (let i = 0; i < results.length; i += 1) {
+      const result = results[i];
+      const stateCode = statesToLoad[i];
+      if (result.status === 'fulfilled') {
+        this._loadedMunicipalityStates.add(stateCode);
+        this._municipalityBoundaryData.features.push(...result.value.features);
+      } else {
+        console.error(`Failed to load municipality boundaries for state ${stateCode}:`, result.reason);
+      }
+    }
+
+    const municipalitySource = this._map.getSource('municipality-boundaries') as maplibregl.GeoJSONSource | undefined;
+    municipalitySource?.setData(this._municipalityBoundaryData as unknown as object);
+  }
 
   override firstUpdated() {
     // DocksPart already calls super.firstUpdated — call it here too
@@ -283,9 +433,18 @@ export class WattmonitorMapPart extends DocksPart {
       // Add country boundaries layer (first layer)
       try {
         const countryBoundaries = await loadCountryBoundaries();
+        const stateBoundaries = await loadStateBoundaries();
         this._map!.addSource('country-boundaries', {
           type: 'geojson',
           data: countryBoundaries,
+        });
+        this._map!.addSource('state-boundaries', {
+          type: 'geojson',
+          data: stateBoundaries,
+        });
+        this._map!.addSource('municipality-boundaries', {
+          type: 'geojson',
+          data: this._municipalityBoundaryData,
         });
         // Get the first existing layer to insert country boundaries before it
         const existingLayers = this._map!.getStyle().layers;
@@ -302,6 +461,52 @@ export class WattmonitorMapPart extends DocksPart {
             'line-width': 2,
           },
         }, beforeId);
+
+        this._map!.addLayer({
+          id: 'state-boundaries-fill',
+          type: 'fill',
+          source: 'state-boundaries',
+          paint: {
+            'fill-color': 'rgba(0, 0, 0, 0)',
+            'fill-opacity': 0,
+          },
+        });
+        this._map!.addLayer({
+          id: 'state-boundaries-line',
+          type: 'line',
+          source: 'state-boundaries',
+          minzoom: 4,
+          paint: {
+            'line-color': 'rgba(147, 197, 253, 0.35)',
+            'line-width': 1.2,
+          },
+        });
+
+        this._map!.addLayer({
+          id: 'municipality-boundaries-fill',
+          type: 'fill',
+          source: 'municipality-boundaries',
+          paint: {
+            'fill-color': 'rgba(0, 0, 0, 0)',
+            'fill-opacity': 0,
+          },
+        });
+        this._map!.addLayer({
+          id: 'municipality-boundaries-line',
+          type: 'line',
+          source: 'municipality-boundaries',
+          minzoom: 7,
+          paint: {
+            'line-color': 'rgba(96, 165, 250, 0.22)',
+            'line-width': 0.8,
+          },
+        });
+
+        this._bindMunicipalityInteractionHandlers();
+        await this._loadMunicipalityBoundariesForVisibleStates();
+        this._map!.on('moveend', () => {
+          void this._loadMunicipalityBoundariesForVisibleStates();
+        });
       } catch (error) {
         console.error('Failed to load country boundaries:', error);
       }
@@ -315,9 +520,18 @@ export class WattmonitorMapPart extends DocksPart {
             if (this._map && !this._map.getSource('country-boundaries')) {
               try {
                 const countryBoundaries = await loadCountryBoundaries();
+                const stateBoundaries = await loadStateBoundaries();
                 this._map.addSource('country-boundaries', {
                   type: 'geojson',
                   data: countryBoundaries,
+                });
+                this._map.addSource('state-boundaries', {
+                  type: 'geojson',
+                  data: stateBoundaries,
+                });
+                this._map.addSource('municipality-boundaries', {
+                  type: 'geojson',
+                  data: this._municipalityBoundaryData,
                 });
               } catch (error) {
                 console.error('Failed to load country boundaries:', error);
@@ -343,6 +557,48 @@ export class WattmonitorMapPart extends DocksPart {
                   'line-width': 1.5,
                 },
               }, beforeId);
+
+              this._map.addLayer({
+                id: 'state-boundaries-fill',
+                type: 'fill',
+                source: 'state-boundaries',
+                paint: {
+                  'fill-color': 'rgba(0, 0, 0, 0)',
+                  'fill-opacity': 0,
+                },
+              });
+              this._map.addLayer({
+                id: 'state-boundaries-line',
+                type: 'line',
+                source: 'state-boundaries',
+                minzoom: 4,
+                paint: {
+                  'line-color': 'rgba(147, 197, 253, 0.35)',
+                  'line-width': 1.2,
+                },
+              });
+
+              this._map.addLayer({
+                id: 'municipality-boundaries-fill',
+                type: 'fill',
+                source: 'municipality-boundaries',
+                paint: {
+                  'fill-color': 'rgba(0, 0, 0, 0)',
+                  'fill-opacity': 0,
+                },
+              });
+              this._map.addLayer({
+                id: 'municipality-boundaries-line',
+                type: 'line',
+                source: 'municipality-boundaries',
+                minzoom: 7,
+                paint: {
+                  'line-color': 'rgba(96, 165, 250, 0.22)',
+                  'line-width': 0.8,
+                },
+              });
+
+              void this._loadMunicipalityBoundariesForVisibleStates();
             }
           }, 100);
         }
@@ -371,7 +627,7 @@ export class WattmonitorMapPart extends DocksPart {
   private async _fetchAll(): Promise<void> {
     loadingSignal.set(true);
     const results = await Promise.allSettled(
-      MUNICIPALITIES.map(m => this._fetchOne(m))
+      this._allMunicipalities().map(m => this._fetchOne(m))
     );
     errorCountSignal.set(results.filter(r => r.status === 'rejected').length);
     loadingSignal.set(false);
@@ -402,7 +658,7 @@ export class WattmonitorMapPart extends DocksPart {
     this._markers.forEach(mk => mk.remove());
     this._markers = [];
 
-    for (const m of MUNICIPALITIES) {
+    for (const m of this._allMunicipalities()) {
       const d = this._data.get(m.key);
       if (!d) continue;
 
