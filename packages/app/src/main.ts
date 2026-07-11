@@ -1,27 +1,29 @@
-import { appLoaderService, contributionRegistry, type HTMLContribution, TOOLBAR_MAIN } from '@eclipse-docks/core';
+import { appLoaderService, contributionRegistry, type HTMLContribution, TOOLBAR_MAIN, TOOLBAR_LAYOUT_SWITCHER, TOOLBAR_LANGUAGE_SELECTOR, TOOLBAR_ACTIVE_PART_NAME } from '@eclipse-docks/core';
 
 /** Which extensions the shell offers; keep in sync with `extension-*` / `@scope/extension-*` entries in package.json (auto side-effect-imported via resolveDepVersionsPlugin). */
 contributionRegistry.registerContribution(TOOLBAR_MAIN, {
   label: 'Brand',
   slot: 'start',
-  component: '<span style="margin-right: 1rem;">wattmonitormap</span>',
+  component: '<div style="display:flex;align-items:center;gap:0.75rem;margin:1rem;"><img src="/logo-loading.svg" alt="WattMonitorMap" style="height:32px;width:32px;"/><span style="font-weight:600;font-size:1.1rem;white-space:nowrap;">WattMonitor Map</span></div>',
 } as HTMLContribution);
 
 const appRoot = document.getElementById('app-root') ?? document.body;
 appLoaderService.registerApp(
   {
+    layout: 'wattmonitor-map',
+    name: 'WattMonitor Map',
+    description: 'WattMonitor Map – Application built with Eclipse Docks.',
+    remaps: [
+      // Hide the layout switcher – this app always uses the map layout.
+      { name: TOOLBAR_LAYOUT_SWITCHER, targets: [] },
+      // Hide the language switcher – UI language is not user-configurable here.
+      { name: TOOLBAR_LANGUAGE_SELECTOR, targets: [] },
+      // Hide the active part name widget – not meaningful for a fullscreen map.
+      { name: TOOLBAR_ACTIVE_PART_NAME, targets: [] },
+    ],
     extensions: [
-      '@eclipse-docks/extension-utils',
       '@eclipse-docks/extension-pwa',
-      '@eclipse-docks/extension-command-palette',
-      '@eclipse-docks/extension-catalog',
-      '@eclipse-docks/extension-md-editor',
-      '@eclipse-docks/extension-plain-editor',
-      '@eclipse-docks/extension-media-viewer',
-      '@eclipse-docks/extension-settings-tree',
-      '@eclipse-docks/extension-memory-usage',
-      '@eclipse-docks/extension-ai-system',
-      'extension-example',
+      'extension-wattmonitor-map',
     ],
   },
   { autoStart: true, hostConfig: true, container: appRoot },

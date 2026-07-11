@@ -1,0 +1,24 @@
+{
+  "name": "extension-wattmonitor-map",
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./src/index.ts"
+    }
+  },
+  "dependencies": {
+    "@eclipse-docks/core": "^0.x",
+    "maplibre-gl": "^5.0.0"
+  },
+  "devDependencies": {
+    "typescript": "^6.0.0",
+    "vite": "^8.0.0"
+  },
+  "scripts": {
+    "build": "vite build"
+  }
+}

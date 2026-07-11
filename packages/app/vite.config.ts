@@ -16,18 +16,23 @@ export default defineConfig({
   base: basePath,
   resolve: {},
   server: {
+    host: '0.0.0.0',
     watch: {
       ignored: ['**/node_modules/**', '**/dist/**'],
     },
+  },
+  preview: {
+    host: '0.0.0.0',
   },
   plugins: [
     appSplashPlugin(),
     /** Side-effect-imports every `extension-*` / `@scope/extension-*` direct dependency from package.json (virtual module before main). */
     resolveDepVersionsPlugin(),
     localAliasesPlugin({
-      useSrcInDev: true,
-      patterns: [{ folderPrefix: 'extension-' }],
-    }),
+        packagesRoot: path.resolve(__dirname, '..'),
+        alwaysUseSrc: true,
+        patterns: [{ folderPrefix: 'extension-' }],
+      }),
     mkcert(),
     crossOriginIsolation(),
     createDocksPwaPlugin({
