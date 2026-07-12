@@ -2,7 +2,7 @@ import { customElement, html, css, unsafeCSS, state } from '@eclipse-docks/core/
 import { DocksPart } from '@eclipse-docks/core';
 import maplibregl from 'maplibre-gl';
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css?inline';
-import { DEFAULT_MUNICIPALITIES, type Municipality } from './municipalities.js';
+import { DEFAULT_MUNICIPALITY_KEYS } from './municipalities.js';
 import { USE_MOCK_DATA, loadingSignal, lastUpdateSignal, errorCountSignal } from './map-status.js';
 import countryBoundariesUrl from './countries.geojson?url';
 import stateBoundariesUrl from './state-boundaries.geojson?url';
@@ -122,11 +122,43 @@ function loadMunicipalityBoundariesForState(stateCode: string): Promise<FeatureC
 }
 
 /** Get the appropriate map style URL based on the current theme preference */
-function getMapStyle(): string {
+function getPreferredMapStyleUrl(): string {
   const isDark = document.documentElement.classList.contains('wa-dark');
   return isDark
     ? 'https://sgx.geodatenzentrum.de/gdz_basemapde_vektor/styles/bm_web_gry.json'
     : 'https://sgx.geodatenzentrum.de/gdz_basemapde_vektor/styles/bm_web_col.json';
+}
+
+function getFallbackMapStyle(): object {
+  const isDark = document.documentElement.classList.contains('wa-dark');
+  return {
+    version: 8,
+    name: 'wattmonitor-maintenance-fallback',
+    sources: {},
+    layers: [
+      {
+        id: 'fallback-background',
+        type: 'background',
+        paint: {
+          'background-color': isDark ? '#0f172a' : '#e5e7eb',
+        },
+      },
+    ],
+  };
+}
+
+async function resolveMapStyleForCurrentTheme(): Promise<string | object> {
+  const styleUrl = getPreferredMapStyleUrl();
+  try {
+    const response = await fetch(styleUrl, { method: 'GET', cache: 'no-store' });
+    if (response.ok) {
+      return styleUrl;
+    }
+    console.warn(`Basemap style endpoint unavailable (HTTP ${response.status}). Using fallback style.`);
+  } catch (error) {
+    console.warn('Basemap style endpoint unavailable. Using fallback style.', error);
+  }
+  return getFallbackMapStyle();
 }
 
 
@@ -197,7 +229,7 @@ function fmtKwh(kwh: number): string {
   return (kwh / 1000).toLocaleString('de-DE', { maximumFractionDigits: 0 }) + ' kWh';
 }
 
-function buildPopupHtml(m: Municipality, d: WattMonitorDataPoint): string {
+function buildPopupHtml(municipalityName: string, d: WattMonitorDataPoint): string {
   const coverage = d.VerbrauchSumme > 0 ? d.ErzeugungSumme / d.VerbrauchSumme : 0;
   const covPct   = Math.round(coverage * 100);
   const color    = coverageColor(coverage);
@@ -209,7 +241,7 @@ function buildPopupHtml(m: Municipality, d: WattMonitorDataPoint): string {
 
   return `
     <div style="font-family:system-ui,sans-serif;min-width:240px;padding:8px;color:var(--wa-color-text-normal);background:var(--wa-color-surface-raised);border-radius:4px;">
-      <div style="font-size:1.1rem;font-weight:700;margin-bottom:6px;color:var(--wa-color-text-normal);">${m.name}</div>
+      <div style="font-size:1.1rem;font-weight:700;margin-bottom:6px;color:var(--wa-color-text-normal);">${municipalityName}</div>
       <div style="display:flex;align-items:center;gap:10px;margin-bottom:10px;">
         <div style="
           width:64px;height:64px;border-radius:50%;
@@ -297,13 +329,354 @@ export class WattmonitorMapPart extends DocksPart {
   private _resizeObserver?: ResizeObserver;
   private _themeMutationObserver?: MutationObserver;
   private _data: Map<string, WattMonitorDataPoint> = new Map();
-  private _dynamicMunicipalities: Map<string, Municipality> = new Map();
+  private _initialCenter: [number, number] = [8.0, 53.35];
+  private _initialZoom = 8.2;
+  private _dynamicMunicipalityKeys = new Set<string>();
+  private _removedDefaultMunicipalityKeys = new Set<string>();
+  private _municipalityNamesByKey: Map<string, string> = new Map();
+  private _dynamicMunicipalityPositions: Map<string, [number, number]> = new Map();
   private _loadedMunicipalityStates = new Set<string>();
   private _municipalityBoundaryData: FeatureCollection = { type: 'FeatureCollection', features: [] };
   private _municipalityHandlersBound = false;
+  private _selectionLoadedFromPersistence = false;
+  private readonly _municipalityHighlightPalette = [
+    '#2563eb',
+    '#16a34a',
+    '#f97316',
+    '#a21caf',
+    '#0ea5e9',
+    '#eab308',
+  ];
 
-  private _allMunicipalities(): Municipality[] {
-    return [...DEFAULT_MUNICIPALITIES, ...this._dynamicMunicipalities.values()];
+  private _highlightedMunicipalityKeys(): string[] {
+    return this._allMunicipalityKeys().filter((municipalityKey) => this._data.has(municipalityKey));
+  }
+
+  private _allMunicipalityKeys(): string[] {
+    const activeDefaultKeys = [...DEFAULT_MUNICIPALITY_KEYS].filter(
+      (municipalityKey) => !this._removedDefaultMunicipalityKeys.has(municipalityKey)
+    );
+    return [...activeDefaultKeys, ...this._dynamicMunicipalityKeys.values()];
+  }
+
+  private _normalizePersistedSelection(value: unknown): string[] {
+    if (!Array.isArray(value)) {
+      return [];
+    }
+    return value
+      .map((entry) => String(entry).trim())
+      .filter((ags) => /^\d{8}$/.test(ags));
+  }
+
+  private _normalizePersistedCenter(value: unknown): [number, number] | undefined {
+    if (!Array.isArray(value) || value.length < 2) {
+      return undefined;
+    }
+
+    const lng = Number(value[0]);
+    const lat = Number(value[1]);
+    if (!Number.isFinite(lng) || !Number.isFinite(lat)) {
+      return undefined;
+    }
+
+    return [lng, lat];
+  }
+
+  private _normalizePersistedZoom(value: unknown): number | undefined {
+    const zoom = Number(value);
+    return Number.isFinite(zoom) ? zoom : undefined;
+  }
+
+  private async _restoreStateFromPersistence(): Promise<void> {
+    if (this._selectionLoadedFromPersistence) {
+      return;
+    }
+
+    this._selectionLoadedFromPersistence = true;
+
+    try {
+      const persisted = await this.getDialogSetting() as {
+        selectedMunicipalityKeys?: unknown;
+        mapView?: { center?: unknown; zoom?: unknown };
+      } | undefined;
+      const selection = this._normalizePersistedSelection(persisted?.selectedMunicipalityKeys);
+      if (selection.length === 0) {
+        // Keep default municipality selection if nothing was persisted.
+      } else {
+        const selectedKeys = new Set(selection);
+
+        this._removedDefaultMunicipalityKeys = new Set(
+          [...DEFAULT_MUNICIPALITY_KEYS].filter((ags) => !selectedKeys.has(ags))
+        );
+
+        this._dynamicMunicipalityKeys = new Set(
+          [...selectedKeys].filter((ags) => !DEFAULT_MUNICIPALITY_KEYS.has(ags))
+        );
+      }
+
+      const persistedCenter = this._normalizePersistedCenter(persisted?.mapView?.center);
+      if (persistedCenter) {
+        this._initialCenter = persistedCenter;
+      }
+
+      const persistedZoom = this._normalizePersistedZoom(persisted?.mapView?.zoom);
+      if (persistedZoom !== undefined) {
+        this._initialZoom = persistedZoom;
+      }
+    } catch (error) {
+      console.warn('Failed to restore map state from persistence:', error);
+    }
+  }
+
+  private _persistState(): void {
+    const selectedMunicipalityKeys = Array.from(new Set(this._allMunicipalityKeys()));
+    const center = this._map ? this._map.getCenter() : { lng: this._initialCenter[0], lat: this._initialCenter[1] };
+    const zoom = this._map ? this._map.getZoom() : this._initialZoom;
+
+    void this.setDialogSetting({
+      selectedMunicipalityKeys,
+      mapView: {
+        center: [Number(center.lng.toFixed(6)), Number(center.lat.toFixed(6))],
+        zoom: Number(zoom.toFixed(2)),
+      },
+    }).catch((error) => {
+      console.warn('Failed to persist map state:', error);
+    });
+  }
+
+  private _removeMunicipalitySelection(municipalityKey: string): void {
+    if (DEFAULT_MUNICIPALITY_KEYS.has(municipalityKey)) {
+      this._removedDefaultMunicipalityKeys.add(municipalityKey);
+    } else {
+      this._dynamicMunicipalityKeys.delete(municipalityKey);
+      this._municipalityNamesByKey.delete(municipalityKey);
+    }
+
+    this._dynamicMunicipalityPositions.delete(municipalityKey);
+    this._data.delete(municipalityKey);
+
+    if (this._openPopup) {
+      this._openPopup.remove();
+      this._openPopup = undefined;
+    }
+
+    this._persistState();
+    this._renderMarkers();
+  }
+
+  private _municipalityName(municipalityKey: string): string {
+    return this._municipalityNamesByKey.get(municipalityKey) ?? `AGS ${municipalityKey}`;
+  }
+
+  private _stateCodeForMunicipalityKey(municipalityKey: string): string | undefined {
+    const stateCode = municipalityKey.slice(0, 2);
+    return STATE_CODES.includes(stateCode as (typeof STATE_CODES)[number]) ? stateCode : undefined;
+  }
+
+  private _syncKnownMunicipalityNamesFromFeatures(features: Array<{ properties?: Record<string, unknown> }>): void {
+    const trackedKeys = new Set(this._allMunicipalityKeys());
+    for (const feature of features) {
+      const properties = feature.properties as Record<string, unknown> | undefined;
+      const key = String(properties?.AGS ?? '').trim();
+      if (!key || !trackedKeys.has(key)) {
+        continue;
+      }
+      const name = String(properties?.GEN ?? '').trim();
+      if (name) {
+        this._municipalityNamesByKey.set(key, name);
+      }
+    }
+  }
+
+  private _extractVertexKeys(geometry: unknown): Set<string> {
+    const vertices = new Set<string>();
+    const coordinates = (geometry as { coordinates?: unknown } | undefined)?.coordinates;
+
+    const walk = (node: unknown): void => {
+      if (!Array.isArray(node)) {
+        return;
+      }
+      if (node.length >= 2 && typeof node[0] === 'number' && typeof node[1] === 'number') {
+        const lng = Number(node[0]).toFixed(6);
+        const lat = Number(node[1]).toFixed(6);
+        vertices.add(`${lng},${lat}`);
+        return;
+      }
+      for (const child of node) {
+        walk(child);
+      }
+    };
+
+    walk(coordinates);
+    return vertices;
+  }
+
+  private _extractCoordinatePairs(geometry: unknown): Array<[number, number]> {
+    const points: Array<[number, number]> = [];
+    const coordinates = (geometry as { coordinates?: unknown } | undefined)?.coordinates;
+
+    const walk = (node: unknown): void => {
+      if (!Array.isArray(node)) {
+        return;
+      }
+      if (node.length >= 2 && typeof node[0] === 'number' && typeof node[1] === 'number') {
+        points.push([Number(node[0]), Number(node[1])]);
+        return;
+      }
+      for (const child of node) {
+        walk(child);
+      }
+    };
+
+    walk(coordinates);
+    return points;
+  }
+
+  private _resolveMunicipalityPosition(municipalityKey: string): [number, number] | undefined {
+    const dynamicPosition = this._dynamicMunicipalityPositions.get(municipalityKey);
+    if (dynamicPosition) {
+      return dynamicPosition;
+    }
+
+    let minLng = Number.POSITIVE_INFINITY;
+    let minLat = Number.POSITIVE_INFINITY;
+    let maxLng = Number.NEGATIVE_INFINITY;
+    let maxLat = Number.NEGATIVE_INFINITY;
+    let hasCoordinates = false;
+
+    for (const feature of this._municipalityBoundaryData.features) {
+      const properties = feature.properties as Record<string, unknown> | undefined;
+      const key = String(properties?.AGS ?? '').trim();
+      if (key !== municipalityKey) {
+        continue;
+      }
+
+      const coordinates = this._extractCoordinatePairs((feature as { geometry?: unknown }).geometry);
+      for (const [lng, lat] of coordinates) {
+        hasCoordinates = true;
+        minLng = Math.min(minLng, lng);
+        minLat = Math.min(minLat, lat);
+        maxLng = Math.max(maxLng, lng);
+        maxLat = Math.max(maxLat, lat);
+      }
+    }
+
+    if (!hasCoordinates) {
+      return undefined;
+    }
+
+    return [(minLng + maxLng) / 2, (minLat + maxLat) / 2];
+  }
+
+  private _buildMunicipalityAdjacency(highlightedKeys: string[]): Map<string, Set<string>> {
+    const highlightedSet = new Set(highlightedKeys);
+    const municipalityVertexKeys = new Map<string, Set<string>>();
+
+    for (const feature of this._municipalityBoundaryData.features) {
+      const properties = feature.properties as Record<string, unknown> | undefined;
+      const key = String(properties?.AGS ?? '').trim();
+      if (!key || !highlightedSet.has(key)) {
+        continue;
+      }
+
+      const featureVertices = this._extractVertexKeys((feature as { geometry?: unknown }).geometry);
+      if (featureVertices.size === 0) {
+        continue;
+      }
+
+      const existing = municipalityVertexKeys.get(key);
+      if (existing) {
+        for (const vertex of featureVertices) {
+          existing.add(vertex);
+        }
+      } else {
+        municipalityVertexKeys.set(key, featureVertices);
+      }
+    }
+
+    const vertexToMunicipalities = new Map<string, string[]>();
+    for (const [key, vertices] of municipalityVertexKeys.entries()) {
+      for (const vertex of vertices) {
+        const linked = vertexToMunicipalities.get(vertex);
+        if (linked) {
+          linked.push(key);
+        } else {
+          vertexToMunicipalities.set(vertex, [key]);
+        }
+      }
+    }
+
+    const adjacency = new Map<string, Set<string>>();
+    for (const key of highlightedKeys) {
+      adjacency.set(key, new Set<string>());
+    }
+
+    for (const linkedMunicipalities of vertexToMunicipalities.values()) {
+      if (linkedMunicipalities.length < 2) {
+        continue;
+      }
+      for (let i = 0; i < linkedMunicipalities.length; i += 1) {
+        for (let j = i + 1; j < linkedMunicipalities.length; j += 1) {
+          const a = linkedMunicipalities[i];
+          const b = linkedMunicipalities[j];
+          adjacency.get(a)?.add(b);
+          adjacency.get(b)?.add(a);
+        }
+      }
+    }
+
+    return adjacency;
+  }
+
+  private _buildMunicipalityColorMap(highlightedKeys: string[]): Map<string, string> {
+    const adjacency = this._buildMunicipalityAdjacency(highlightedKeys);
+    const orderedKeys = [...highlightedKeys].sort((a, b) => {
+      const degreeDiff = (adjacency.get(b)?.size ?? 0) - (adjacency.get(a)?.size ?? 0);
+      return degreeDiff !== 0 ? degreeDiff : a.localeCompare(b);
+    });
+
+    const colorMap = new Map<string, string>();
+    for (const key of orderedKeys) {
+      const usedByNeighbors = new Set(
+        [...(adjacency.get(key) ?? new Set<string>())]
+          .map((neighbor) => colorMap.get(neighbor))
+          .filter((color): color is string => Boolean(color))
+      );
+
+      const selected = this._municipalityHighlightPalette.find((color) => !usedByNeighbors.has(color));
+      if (selected) {
+        colorMap.set(key, selected);
+      } else {
+        const fallbackIndex = Math.abs(
+          key.split('').reduce((acc, char) => (acc * 31 + char.charCodeAt(0)) | 0, 17)
+        ) % this._municipalityHighlightPalette.length;
+        colorMap.set(key, this._municipalityHighlightPalette[fallbackIndex]);
+      }
+    }
+
+    return colorMap;
+  }
+
+  private _updateMunicipalityHighlights(): void {
+    if (!this._map || !this._map.getLayer('municipality-boundaries-highlight')) {
+      return;
+    }
+    const keys = this._highlightedMunicipalityKeys();
+    if (keys.length === 0) {
+      this._map.setFilter('municipality-boundaries-highlight', ['==', ['get', 'AGS'], '__none__']);
+      this._map.setPaintProperty('municipality-boundaries-highlight', 'fill-color', 'rgba(59, 130, 246, 0.35)');
+      return;
+    }
+
+    const colorMap = this._buildMunicipalityColorMap(keys);
+    const colorMatchExpression: unknown[] = ['match', ['get', 'AGS']];
+    for (const key of keys) {
+      colorMatchExpression.push(key, colorMap.get(key) ?? '#2563eb');
+    }
+    colorMatchExpression.push('#2563eb');
+
+    this._map.setPaintProperty('municipality-boundaries-highlight', 'fill-color', colorMatchExpression);
+    this._map.setFilter('municipality-boundaries-highlight', ['in', ['get', 'AGS'], ['literal', keys]]);
   }
 
   private _bindMunicipalityInteractionHandlers(): void {
@@ -326,25 +699,44 @@ export class WattmonitorMapPart extends DocksPart {
       const key = String(properties.AGS ?? '').trim();
       if (!key) return;
       const name = String(properties.GEN ?? `AGS ${key}`);
+      this._municipalityNamesByKey.set(key, name);
 
-      if (!DEFAULT_MUNICIPALITIES.some((m) => m.key === key) && !this._dynamicMunicipalities.has(key)) {
-        this._dynamicMunicipalities.set(key, {
-          key,
-          name,
-          lng: event.lngLat.lng,
-          lat: event.lngLat.lat,
-        });
+      if (this._removedDefaultMunicipalityKeys.has(key)) {
+        this._removedDefaultMunicipalityKeys.delete(key);
       }
 
-      const target = this._allMunicipalities().find((m) => m.key === key);
-      if (!target) return;
+      // Always use the most recent click as marker position override.
+      this._dynamicMunicipalityPositions.set(key, [event.lngLat.lng, event.lngLat.lat]);
+
+      if (!DEFAULT_MUNICIPALITY_KEYS.has(key) && !this._dynamicMunicipalityKeys.has(key)) {
+        this._dynamicMunicipalityKeys.add(key);
+      }
+
+      this._persistState();
 
       try {
-        await this._fetchOne(target);
-        this._renderMarkers();
+        await this._fetchOne(key);
       } catch (error) {
         console.error(`Failed to load municipality data for ${key}:`, error);
+      } finally {
+        this._renderMarkers();
       }
+    });
+
+    this._map.on('dblclick', 'municipality-boundaries-fill', (event) => {
+      const feature = event.features?.[0];
+      if (!feature?.properties) return;
+
+      const properties = feature.properties as Record<string, unknown>;
+      const key = String(properties.AGS ?? '').trim();
+      if (!key) return;
+
+      if (!this._allMunicipalityKeys().includes(key)) {
+        return;
+      }
+
+      event.preventDefault();
+      this._removeMunicipalitySelection(key);
     });
 
     this._municipalityHandlersBound = true;
@@ -356,11 +748,20 @@ export class WattmonitorMapPart extends DocksPart {
     }
 
     const visibleStates = this._map.queryRenderedFeatures(undefined, { layers: ['state-boundaries-fill'] });
-    const statesToLoad = Array.from(new Set(
+    const statesFromViewport = Array.from(new Set(
       visibleStates
         .map((feature) => String((feature.properties as Record<string, unknown> | undefined)?.SN_L ?? '').padStart(2, '0'))
         .filter((stateCode) => STATE_CODES.includes(stateCode as (typeof STATE_CODES)[number]))
-    )).filter((stateCode) => !this._loadedMunicipalityStates.has(stateCode));
+    ));
+
+    const statesFromTrackedMunicipalities = this._allMunicipalityKeys()
+      .map((municipalityKey) => this._stateCodeForMunicipalityKey(municipalityKey))
+      .filter((stateCode): stateCode is string => Boolean(stateCode));
+
+    const statesToLoad = Array.from(new Set([
+      ...statesFromViewport,
+      ...statesFromTrackedMunicipalities,
+    ])).filter((stateCode) => !this._loadedMunicipalityStates.has(stateCode));
 
     if (statesToLoad.length === 0) {
       return;
@@ -372,6 +773,7 @@ export class WattmonitorMapPart extends DocksPart {
       const stateCode = statesToLoad[i];
       if (result.status === 'fulfilled') {
         this._loadedMunicipalityStates.add(stateCode);
+        this._syncKnownMunicipalityNamesFromFeatures(result.value.features);
         this._municipalityBoundaryData.features.push(...result.value.features);
       } else {
         console.error(`Failed to load municipality boundaries for state ${stateCode}:`, result.reason);
@@ -380,11 +782,15 @@ export class WattmonitorMapPart extends DocksPart {
 
     const municipalitySource = this._map.getSource('municipality-boundaries') as maplibregl.GeoJSONSource | undefined;
     municipalitySource?.setData(this._municipalityBoundaryData as unknown as object);
+    this._updateMunicipalityHighlights();
+    this._renderMarkers();
   }
 
-  override firstUpdated() {
+  override async firstUpdated() {
     // DocksPart already calls super.firstUpdated — call it here too
     super.firstUpdated(new Map());
+
+    await this._restoreStateFromPersistence();
 
     // Add theme-aware CSS for MapLibre popups
     const existingStyle = document.getElementById('wattmonitor-popup-styles');
@@ -418,11 +824,13 @@ export class WattmonitorMapPart extends DocksPart {
     const container = this.renderRoot.querySelector<HTMLElement>('#wmm-map');
     if (!container) return;
 
+    const initialStyle = await resolveMapStyleForCurrentTheme();
+
     this._map = new maplibregl.Map({
       container,
-      style: getMapStyle(),
-      center: [8.0, 53.35],
-      zoom: 8.2,
+      style: initialStyle,
+      center: this._initialCenter,
+      zoom: this._initialZoom,
       attributionControl: false,
     });
 
@@ -492,6 +900,17 @@ export class WattmonitorMapPart extends DocksPart {
           },
         });
         this._map!.addLayer({
+          id: 'municipality-boundaries-highlight',
+          type: 'fill',
+          source: 'municipality-boundaries',
+          minzoom: 7,
+          paint: {
+            'fill-color': 'rgba(59, 130, 246, 0.32)',
+            'fill-opacity': 0.45,
+          },
+          filter: ['==', ['get', 'AGS'], '__none__'],
+        });
+        this._map!.addLayer({
           id: 'municipality-boundaries-line',
           type: 'line',
           source: 'municipality-boundaries',
@@ -504,8 +923,10 @@ export class WattmonitorMapPart extends DocksPart {
 
         this._bindMunicipalityInteractionHandlers();
         await this._loadMunicipalityBoundariesForVisibleStates();
+        this._updateMunicipalityHighlights();
         this._map!.on('moveend', () => {
           void this._loadMunicipalityBoundariesForVisibleStates();
+          this._persistState();
         });
       } catch (error) {
         console.error('Failed to load country boundaries:', error);
@@ -514,9 +935,10 @@ export class WattmonitorMapPart extends DocksPart {
       // Set up theme change listener
       this._themeMutationObserver = new MutationObserver(() => {
         if (this._map) {
-          this._map.setStyle(getMapStyle());
-          // Re-add layers after style change
-          setTimeout(async () => {
+          void resolveMapStyleForCurrentTheme().then((resolvedStyle) => {
+            this._map!.setStyle(resolvedStyle);
+            // Re-add layers after style change
+            setTimeout(async () => {
             if (this._map && !this._map.getSource('country-boundaries')) {
               try {
                 const countryBoundaries = await loadCountryBoundaries();
@@ -588,6 +1010,17 @@ export class WattmonitorMapPart extends DocksPart {
                 },
               });
               this._map.addLayer({
+                id: 'municipality-boundaries-highlight',
+                type: 'fill',
+                source: 'municipality-boundaries',
+                minzoom: 7,
+                paint: {
+                  'fill-color': 'rgba(59, 130, 246, 0.32)',
+                  'fill-opacity': 0.45,
+                },
+                filter: ['==', ['get', 'AGS'], '__none__'],
+              });
+              this._map.addLayer({
                 id: 'municipality-boundaries-line',
                 type: 'line',
                 source: 'municipality-boundaries',
@@ -599,8 +1032,10 @@ export class WattmonitorMapPart extends DocksPart {
               });
 
               void this._loadMunicipalityBoundariesForVisibleStates();
+              this._updateMunicipalityHighlights();
             }
-          }, 100);
+            }, 100);
+          });
         }
       });
       this._themeMutationObserver.observe(document.documentElement, {
@@ -618,6 +1053,7 @@ export class WattmonitorMapPart extends DocksPart {
 
   override disconnectedCallback() {
     super.disconnectedCallback();
+    this._persistState();
     clearInterval(this._refreshTimer);
     this._resizeObserver?.disconnect();
     this._themeMutationObserver?.disconnect();
@@ -627,7 +1063,7 @@ export class WattmonitorMapPart extends DocksPart {
   private async _fetchAll(): Promise<void> {
     loadingSignal.set(true);
     const results = await Promise.allSettled(
-      this._allMunicipalities().map(m => this._fetchOne(m))
+      this._allMunicipalityKeys().map((municipalityKey) => this._fetchOne(municipalityKey))
     );
     errorCountSignal.set(results.filter(r => r.status === 'rejected').length);
     loadingSignal.set(false);
@@ -635,21 +1071,21 @@ export class WattmonitorMapPart extends DocksPart {
     this._renderMarkers();
   }
 
-  private async _fetchOne(m: Municipality): Promise<void> {
+  private async _fetchOne(municipalityKey: string): Promise<void> {
     if (USE_MOCK_DATA) {
       await new Promise(r => setTimeout(r, 50));
-      this._data.set(m.key, generateMockData(m.key));
+      this._data.set(municipalityKey, generateMockData(municipalityKey));
       return;
     }
     const res = await fetch(`${API_BASE}/api/getdata`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(m.key),
+      body: JSON.stringify(municipalityKey),
     });
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     const data: WattMonitorDataPoint[] = await res.json();
     if (!Array.isArray(data) || data.length === 0) throw new Error('empty response');
-    this._data.set(m.key, data[0]);
+    this._data.set(municipalityKey, data[0]);
   }
 
   private _renderMarkers(): void {
@@ -658,9 +1094,12 @@ export class WattmonitorMapPart extends DocksPart {
     this._markers.forEach(mk => mk.remove());
     this._markers = [];
 
-    for (const m of this._allMunicipalities()) {
-      const d = this._data.get(m.key);
+    for (const municipalityKey of this._allMunicipalityKeys()) {
+      const d = this._data.get(municipalityKey);
       if (!d) continue;
+      const position = this._resolveMunicipalityPosition(municipalityKey);
+      if (!position) continue;
+      const municipalityName = this._municipalityName(municipalityKey);
 
       const coverage = d.VerbrauchSumme > 0 ? d.ErzeugungSumme / d.VerbrauchSumme : 0;
       const color    = coverageColor(coverage);
@@ -700,7 +1139,7 @@ export class WattmonitorMapPart extends DocksPart {
         </div>
         <div style="background:${color};color:#fff;font-size:0.65rem;font-family:system-ui,sans-serif;
           font-weight:600;padding:1px 5px;border-radius:3px;margin-top:3px;white-space:nowrap;text-align:center;">
-          ${m.name}</div>
+          ${municipalityName}</div>
         <div style="font-size:0.6rem;color:var(--wa-color-text-quiet);margin-top:3px;text-align:center;line-height:1.3;border-top:1px solid var(--wa-color-surface-border);padding-top:2px;width:100%;">
           <div style="color:var(--wa-color-success-fill-loud);font-weight:600;">⚡ ${erzeugungMwh} MWh</div>
           <div>🏠 ${verbrauchMwh} MWh</div>
@@ -708,7 +1147,7 @@ export class WattmonitorMapPart extends DocksPart {
         </div>`;
 
       const popup = new maplibregl.Popup({ offset: 28, maxWidth: '320px', closeButton: true })
-        .setHTML(buildPopupHtml(m, d));
+        .setHTML(buildPopupHtml(municipalityName, d));
 
       // Attach click listener BEFORE creating marker so it captures events properly
       el.addEventListener('click', (e) => {
@@ -716,16 +1155,18 @@ export class WattmonitorMapPart extends DocksPart {
         if (this._openPopup) {
           this._openPopup.remove();
         }
-        popup.setLngLat([m.lng, m.lat]).addTo(this._map!);
+        popup.setLngLat(position).addTo(this._map!);
         this._openPopup = popup;
       });
 
       const marker = new maplibregl.Marker({ element: el, anchor: 'bottom' })
-        .setLngLat([m.lng, m.lat])
+        .setLngLat(position)
         .addTo(this._map!);
 
       this._markers.push(marker);
     }
+
+    this._updateMunicipalityHighlights();
   }
 
   protected override renderContent() {
