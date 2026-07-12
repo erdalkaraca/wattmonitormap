@@ -291,6 +291,15 @@ function buildPopupHtml(municipalityName: string, d: WattMonitorDataPoint): stri
     </div>`;
 }
 
+function buildErrorPopupHtml(municipalityName: string, message: string): string {
+  return `
+    <div style="font-family:system-ui,sans-serif;min-width:220px;padding:8px;color:var(--wa-color-text-normal);background:var(--wa-color-surface-raised);border-radius:4px;">
+      <div style="font-size:1.05rem;font-weight:700;margin-bottom:6px;color:var(--wa-color-text-normal);">${municipalityName}</div>
+      <div style="font-size:0.82rem;font-weight:600;color:var(--wa-color-danger-fill-loud);margin-bottom:4px;">Keine Lastdaten verfugbar</div>
+      <div style="font-size:0.75rem;color:var(--wa-color-text-quiet);line-height:1.4;">${message}</div>
+    </div>`;
+}
+
 @customElement('wattmonitor-map-part')
 export class WattmonitorMapPart extends DocksPart {
   /** DocksPart: no outer scroller – MapLibre manages its own scroll and touch gestures. */
@@ -327,7 +336,9 @@ export class WattmonitorMapPart extends DocksPart {
   private _refreshTimer?: ReturnType<typeof setInterval>;
   private _resizeObserver?: ResizeObserver;
   private _themeMutationObserver?: MutationObserver;
+  private _activeLoadCount = 0;
   private _data: Map<string, WattMonitorDataPoint> = new Map();
+  private _fetchErrors: Map<string, string> = new Map();
   private _initialCenter: [number, number] = [8.0, 53.35];
   private _initialZoom = 8.2;
   private _dynamicMunicipalityKeys = new Set<string>();
@@ -359,6 +370,16 @@ export class WattmonitorMapPart extends DocksPart {
       (municipalityKey) => !this._removedDefaultMunicipalityKeys.has(municipalityKey)
     );
     return [...activeDefaultKeys, ...this._dynamicMunicipalityKeys.values()];
+  }
+
+  private _beginLoading(): void {
+    this._activeLoadCount += 1;
+    loadingSignal.set(true);
+  }
+
+  private _endLoading(): void {
+    this._activeLoadCount = Math.max(0, this._activeLoadCount - 1);
+    loadingSignal.set(this._activeLoadCount > 0);
   }
 
   private _normalizePersistedSelection(value: unknown): string[] {
@@ -456,6 +477,7 @@ export class WattmonitorMapPart extends DocksPart {
 
     this._dynamicMunicipalityPositions.delete(municipalityKey);
     this._data.delete(municipalityKey);
+    this._fetchErrors.delete(municipalityKey);
 
     if (this._openPopup) {
       this._openPopup.remove();
@@ -716,11 +738,13 @@ export class WattmonitorMapPart extends DocksPart {
 
       this._persistState();
 
+      this._beginLoading();
       try {
         await this._fetchOne(key);
       } catch (error) {
         console.error(`Failed to load municipality data for ${key}:`, error);
       } finally {
+        this._endLoading();
         this._renderMarkers();
       }
     });
@@ -1069,31 +1093,43 @@ export class WattmonitorMapPart extends DocksPart {
   }
 
   private async _fetchAll(): Promise<void> {
-    loadingSignal.set(true);
-    const results = await Promise.allSettled(
-      this._allMunicipalityKeys().map((municipalityKey) => this._fetchOne(municipalityKey))
-    );
-    errorCountSignal.set(results.filter(r => r.status === 'rejected').length);
-    loadingSignal.set(false);
-    lastUpdateSignal.set(new Date());
-    this._renderMarkers();
+    this._beginLoading();
+    try {
+      const results = await Promise.allSettled(
+        this._allMunicipalityKeys().map((municipalityKey) => this._fetchOne(municipalityKey))
+      );
+      errorCountSignal.set(results.filter(r => r.status === 'rejected').length);
+      lastUpdateSignal.set(new Date());
+      this._renderMarkers();
+    } finally {
+      this._endLoading();
+    }
   }
 
   private async _fetchOne(municipalityKey: string): Promise<void> {
     if (USE_MOCK_DATA) {
       await new Promise(r => setTimeout(r, 50));
       this._data.set(municipalityKey, generateMockData(municipalityKey));
+      this._fetchErrors.delete(municipalityKey);
       return;
     }
-    const res = await fetch(`${API_BASE}/api/getdata`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(municipalityKey),
-    });
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    const data: WattMonitorDataPoint[] = await res.json();
-    if (!Array.isArray(data) || data.length === 0) throw new Error('empty response');
-    this._data.set(municipalityKey, data[0]);
+    try {
+      const res = await fetch(`${API_BASE}/api/getdata`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(municipalityKey),
+      });
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data: WattMonitorDataPoint[] = await res.json();
+      if (!Array.isArray(data) || data.length === 0) throw new Error('empty response');
+      this._data.set(municipalityKey, data[0]);
+      this._fetchErrors.delete(municipalityKey);
+    } catch (error) {
+      this._data.delete(municipalityKey);
+      const message = error instanceof Error ? error.message : String(error);
+      this._fetchErrors.set(municipalityKey, message);
+      throw error;
+    }
   }
 
   private _renderMarkers(): void {
@@ -1104,10 +1140,40 @@ export class WattmonitorMapPart extends DocksPart {
 
     for (const municipalityKey of this._allMunicipalityKeys()) {
       const d = this._data.get(municipalityKey);
-      if (!d) continue;
+      const fetchError = this._fetchErrors.get(municipalityKey);
+      if (!d && !fetchError) continue;
       const position = this._resolveMunicipalityPosition(municipalityKey);
       if (!position) continue;
       const municipalityName = this._municipalityName(municipalityKey);
+
+      if (!d) {
+        const errorMessage = fetchError ?? 'Unbekannter Fehler';
+        const el = document.createElement('div');
+        el.style.cssText = 'cursor:pointer;display:flex;flex-direction:column;align-items:center;filter:drop-shadow(0 2px 4px rgba(0,0,0,.35));background:var(--wa-color-surface-raised);padding:6px 5px;border-radius:6px;max-width:140px;border:1px solid var(--wa-color-danger-fill-quiet);';
+        el.innerHTML = `
+          <div style="background:var(--wa-color-danger-fill-loud);color:#fff;border-radius:4px;padding:2px 6px;font-size:0.66rem;font-weight:700;font-family:system-ui,sans-serif;">Keine Daten</div>
+          <div style="font-size:0.68rem;color:var(--wa-color-text-normal);margin-top:4px;text-align:center;font-weight:600;line-height:1.2;">${municipalityName}</div>
+          <div style="font-size:0.6rem;color:var(--wa-color-text-quiet);margin-top:2px;text-align:center;line-height:1.25;max-width:132px;">${errorMessage}</div>`;
+
+        const popup = new maplibregl.Popup({ offset: 28, maxWidth: '320px', closeButton: true })
+          .setHTML(buildErrorPopupHtml(municipalityName, errorMessage));
+
+        el.addEventListener('click', (e) => {
+          e.stopPropagation();
+          if (this._openPopup) {
+            this._openPopup.remove();
+          }
+          popup.setLngLat(position).addTo(this._map!);
+          this._openPopup = popup;
+        });
+
+        const marker = new maplibregl.Marker({ element: el, anchor: 'bottom' })
+          .setLngLat(position)
+          .addTo(this._map!);
+
+        this._markers.push(marker);
+        continue;
+      }
 
       const coverage = d.VerbrauchSumme > 0 ? d.ErzeugungSumme / d.VerbrauchSumme : 0;
       const color    = coverageColor(coverage);
