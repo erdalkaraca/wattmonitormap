@@ -1,9 +1,13 @@
 import { customElement, html } from '@eclipse-docks/core/externals/lit';
 import { DocksElement, DocksWidget } from '@eclipse-docks/core';
-import { USE_MOCK_DATA, loadingSignal, lastUpdateSignal, errorCountSignal } from './map-status.js';
+import { RELOAD_REQUEST_EVENT, USE_MOCK_DATA, loadingSignal, lastUpdateSignal, errorCountSignal } from './map-status.js';
 
 @customElement('wattmonitor-status-widget')
 export class WattmonitorStatusWidget extends DocksElement {
+  private _onRefreshClick = () => {
+    window.dispatchEvent(new CustomEvent(RELOAD_REQUEST_EVENT));
+  };
+
   protected override doBeforeUI() {
     // Watch all three status signals for changes and re-render when they update
     this.watch(loadingSignal, () => this.requestUpdate());
@@ -27,11 +31,20 @@ export class WattmonitorStatusWidget extends DocksElement {
         color:var(--wa-color-text-normal);
         flex-wrap:nowrap;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
       ">
-        ${loading
-          ? html`<span style="color:var(--wa-color-text-quiet);white-space:nowrap;">⟳ Lädt…</span>`
-          : errorCount > 0
-            ? html`<span style="color:var(--wa-color-danger-fill-loud);white-space:nowrap;">⚠ ${errorCount} Fehler</span>`
-            : html`<span style="color:var(--wa-color-success-fill-loud);white-space:nowrap;">✓ Aktuell</span>`}
+        <wa-button
+          size="small"
+          appearance="plain"
+          ?disabled=${loading}
+          @click=${this._onRefreshClick}
+          style="white-space:nowrap;"
+        >
+          <wa-icon name="refresh"></wa-icon>
+          ${loading
+            ? 'Lädt…'
+            : errorCount > 0
+              ? `Aktualisieren (${errorCount} Fehler)`
+              : 'Aktuell'}
+        </wa-button>
         <span style="color:var(--wa-color-text-quiet);white-space:nowrap;">Stand: ${ts}</span>
         ${USE_MOCK_DATA ? html`<span style="color:var(--wa-color-brand-fill-loud);font-weight:600;white-space:nowrap;">[Mock]</span>` : ''}
       </div>

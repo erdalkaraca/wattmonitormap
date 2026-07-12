@@ -3,7 +3,7 @@ import { DocksPart } from '@eclipse-docks/core';
 import maplibregl from 'maplibre-gl';
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css?inline';
 import { DEFAULT_MUNICIPALITY_KEYS } from './municipalities.js';
-import { USE_MOCK_DATA, loadingSignal, lastUpdateSignal, errorCountSignal } from './map-status.js';
+import { RELOAD_REQUEST_EVENT, USE_MOCK_DATA, loadingSignal, lastUpdateSignal, errorCountSignal } from './map-status.js';
 import countryBoundariesUrl from './countries.geojson?url';
 import stateBoundariesUrl from './state-boundaries.geojson?url';
 
@@ -346,6 +346,9 @@ export class WattmonitorMapPart extends DocksPart {
     '#0ea5e9',
     '#eab308',
   ];
+  private _onManualReload = () => {
+    void this._fetchAll();
+  };
 
   private _highlightedMunicipalityKeys(): string[] {
     return this._allMunicipalityKeys().filter((municipalityKey) => this._data.has(municipalityKey));
@@ -1050,8 +1053,14 @@ export class WattmonitorMapPart extends DocksPart {
     this._resizeObserver.observe(container);
   }
 
+  override connectedCallback() {
+    super.connectedCallback();
+    window.addEventListener(RELOAD_REQUEST_EVENT, this._onManualReload as EventListener);
+  }
+
   override disconnectedCallback() {
     super.disconnectedCallback();
+    window.removeEventListener(RELOAD_REQUEST_EVENT, this._onManualReload as EventListener);
     this._persistState();
     clearInterval(this._refreshTimer);
     this._resizeObserver?.disconnect();
