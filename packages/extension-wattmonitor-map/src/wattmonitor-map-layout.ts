@@ -61,6 +61,12 @@ export class WattmonitorMapLayout extends DocksContainer {
           position: relative;
         }
 
+        wattmonitor-map-layout .toolbar-bottom > :nth-child(2) {
+          justify-self: stretch;
+          display: flex;
+          justify-content: center;
+        }
+
         wattmonitor-map-layout .toolbar-bottom {
           width: 100%;
           border-top: solid var(--wa-border-width-s) var(--wa-color-neutral-border-loud);

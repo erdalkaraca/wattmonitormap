@@ -32,19 +32,20 @@ export class WattmonitorStatusWidget extends DocksElement {
         flex-wrap:nowrap;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
       ">
         <wa-button
-          size="small"
-          appearance="plain"
+          size="s"
+          appearance=${loading ? 'accent' : 'plain'}
           ?disabled=${loading}
           @click=${this._onRefreshClick}
           style="white-space:nowrap;"
         >
-          <wa-icon name="refresh"></wa-icon>
+          <wa-icon name="refresh" style=${loading ? 'animation:wmm-refresh-spin 0.9s linear infinite;' : ''}></wa-icon>
           ${loading
             ? 'Lädt…'
             : errorCount > 0
               ? `Aktualisieren (${errorCount} Fehler)`
               : 'Aktuell'}
         </wa-button>
+        <style>@keyframes wmm-refresh-spin{to{transform:rotate(360deg)}}</style>
         <span style="color:var(--wa-color-text-quiet);white-space:nowrap;">Stand: ${ts}</span>
         ${USE_MOCK_DATA ? html`<span style="color:var(--wa-color-brand-fill-loud);font-weight:600;white-space:nowrap;">[Mock]</span>` : ''}
       </div>

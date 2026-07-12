@@ -6,6 +6,8 @@ export class WattmonitorAttributionWidget extends DocksWidget {
   override render() {
     return html`
       <div style="
+        display:flex;align-items:center;justify-content:center;
+        width:100%;text-align:center;
         font-size:var(--wa-font-size-xs);padding:0 var(--wa-space-s);
         color:var(--wa-color-text-quiet);font-family:system-ui,sans-serif;">
         © <a href="https://basemap.de" 

@@ -22,7 +22,7 @@ contributionRegistry.registerContribution(TOOLBAR_BOTTOM, {
 contributionRegistry.registerContribution(TOOLBAR_BOTTOM_CENTER, {
   label: 'Map Attribution',
   name: 'wattmonitor.attribution',
-  slot: 'end',
+  slot: 'start',
   component: '<wattmonitor-attribution-widget></wattmonitor-attribution-widget>',
 } as HTMLContribution);
 

@@ -1,7 +1,10 @@
 import { customElement, html, css, unsafeCSS, state } from '@eclipse-docks/core/externals/lit';
 import { DocksPart } from '@eclipse-docks/core';
 import maplibregl from 'maplibre-gl';
+import maplibreWorkerUrl from 'maplibre-gl/dist/maplibre-gl-csp-worker.js?url';
 import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css?inline';
+
+maplibregl.setWorkerUrl(maplibreWorkerUrl);
 import { DEFAULT_MUNICIPALITY_KEYS } from './municipalities.js';
 import { RELOAD_REQUEST_EVENT, USE_MOCK_DATA, loadingSignal, lastUpdateSignal, errorCountSignal } from './map-status.js';
 import countryBoundariesUrl from './countries.geojson?url';
@@ -36,9 +39,7 @@ export interface WattMonitorDataPoint {
   Niederschlag: number;
 }
 
-// In local dev, `/api` is proxied by Vite to avoid browser CORS restrictions.
-// In preview/production builds, call the backend directly (requires backend CORS).
-const API_BASE = import.meta.env.DEV ? '' : 'https://wattmonitor.ewe-netz.de';
+const API_BASE = import.meta.env.VITE_API_BASE ?? '';
 const REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 min
 
 const STATE_CODES = [
@@ -115,6 +116,9 @@ function loadMunicipalityBoundariesForState(stateCode: string): Promise<FeatureC
       throw new Error(`Failed to fetch municipality boundaries for state ${normalizedStateCode}: HTTP ${response.status}`);
     }
     return response.json() as Promise<FeatureCollection>;
+  }).catch((error) => {
+    municipalityBoundariesByStatePromise.delete(normalizedStateCode);
+    throw error;
   });
   municipalityBoundariesByStatePromise.set(normalizedStateCode, requestPromise);
   return requestPromise;
@@ -337,6 +341,7 @@ export class WattmonitorMapPart extends DocksPart {
   private _resizeObserver?: ResizeObserver;
   private _themeMutationObserver?: MutationObserver;
   private _activeLoadCount = 0;
+  private _loadingMunicipalityKeys = new Set<string>();
   private _data: Map<string, WattMonitorDataPoint> = new Map();
   private _fetchErrors: Map<string, string> = new Map();
   private _initialCenter: [number, number] = [8.0, 53.35];
@@ -348,6 +353,12 @@ export class WattmonitorMapPart extends DocksPart {
   private _loadedMunicipalityStates = new Set<string>();
   private _municipalityBoundaryData: FeatureCollection = { type: 'FeatureCollection', features: [] };
   private _municipalityHandlersBound = false;
+  private _mapLayersReady = false;
+  private _moveEndHandlerBound = false;
+  private _themeObserverBound = false;
+  private _styleSetupPromise: Promise<void> = Promise.resolve();
+  private _boundarySetupScheduled = false;
+  private _activeMapStyle?: string | object;
   private _selectionLoadedFromPersistence = false;
   private readonly _municipalityHighlightPalette = [
     '#2563eb',
@@ -708,72 +719,357 @@ export class WattmonitorMapPart extends DocksPart {
       return;
     }
 
-    this._map.on('mouseenter', 'municipality-boundaries-fill', () => {
-      this._map!.getCanvas().style.cursor = 'pointer';
-    });
-    this._map.on('mouseleave', 'municipality-boundaries-fill', () => {
-      this._map!.getCanvas().style.cursor = '';
-    });
-
-    this._map.on('click', 'municipality-boundaries-fill', async (event) => {
-      const feature = event.features?.[0];
-      if (!feature?.properties) return;
-
-      const properties = feature.properties as Record<string, unknown>;
-      const key = String(properties.AGS ?? '').trim();
-      if (!key) return;
-      const name = String(properties.GEN ?? `AGS ${key}`);
-      this._municipalityNamesByKey.set(key, name);
-
-      if (this._removedDefaultMunicipalityKeys.has(key)) {
-        this._removedDefaultMunicipalityKeys.delete(key);
-      }
-
-      // Always use the most recent click as marker position override.
-      this._dynamicMunicipalityPositions.set(key, [event.lngLat.lng, event.lngLat.lat]);
-
-      if (!DEFAULT_MUNICIPALITY_KEYS.has(key) && !this._dynamicMunicipalityKeys.has(key)) {
-        this._dynamicMunicipalityKeys.add(key);
-      }
-
-      this._persistState();
-
-      this._beginLoading();
-      try {
-        await this._fetchOne(key);
-      } catch (error) {
-        console.error(`Failed to load municipality data for ${key}:`, error);
-      } finally {
-        this._endLoading();
-        this._renderMarkers();
-      }
-    });
-
-    this._map.on('dblclick', 'municipality-boundaries-fill', (event) => {
-      const feature = event.features?.[0];
-      if (!feature?.properties) return;
-
-      const properties = feature.properties as Record<string, unknown>;
-      const key = String(properties.AGS ?? '').trim();
-      if (!key) return;
-
-      if (!this._allMunicipalityKeys().includes(key)) {
-        return;
-      }
-
-      event.preventDefault();
-      this._removeMunicipalitySelection(key);
-    });
+    this._map.on('mousemove', this._handleMapMouseMove);
+    this._map.on('click', this._handleMapClick);
+    this._map.on('dblclick', this._handleMapDblClick);
 
     this._municipalityHandlersBound = true;
   }
 
-  private async _loadMunicipalityBoundariesForVisibleStates(): Promise<void> {
-    if (!this._map || !this._map.getLayer('state-boundaries-fill')) {
+  private _handleMapMouseMove = (event: maplibregl.MapMouseEvent): void => {
+    if (!this._map?.getLayer('municipality-boundaries-fill')) {
+      this._map!.getCanvas().style.cursor = '';
       return;
     }
 
-    const visibleStates = this._map.queryRenderedFeatures(undefined, { layers: ['state-boundaries-fill'] });
+    const features = this._map.queryRenderedFeatures(event.point, {
+      layers: ['municipality-boundaries-fill'],
+    });
+    this._map.getCanvas().style.cursor = features.length > 0 ? 'pointer' : '';
+  };
+
+  private _handleMapClick = async (event: maplibregl.MapMouseEvent): Promise<void> => {
+    if (!this._map?.getLayer('municipality-boundaries-fill')) {
+      return;
+    }
+
+    const feature = this._map.queryRenderedFeatures(event.point, {
+      layers: ['municipality-boundaries-fill'],
+    })[0];
+    if (!feature?.properties) return;
+
+    const properties = feature.properties as Record<string, unknown>;
+    const key = String(properties.AGS ?? '').trim();
+    if (!key) return;
+    const name = String(properties.GEN ?? `AGS ${key}`);
+    this._municipalityNamesByKey.set(key, name);
+
+    if (this._removedDefaultMunicipalityKeys.has(key)) {
+      this._removedDefaultMunicipalityKeys.delete(key);
+    }
+
+    this._dynamicMunicipalityPositions.set(key, [event.lngLat.lng, event.lngLat.lat]);
+
+    if (!DEFAULT_MUNICIPALITY_KEYS.has(key) && !this._dynamicMunicipalityKeys.has(key)) {
+      this._dynamicMunicipalityKeys.add(key);
+    }
+
+    this._persistState();
+
+    this._loadingMunicipalityKeys.add(key);
+    this._beginLoading();
+    this._renderMarkers();
+
+    try {
+      await this._fetchOne(key);
+    } catch (error) {
+      console.error(`Failed to load municipality data for ${key}:`, error);
+    } finally {
+      this._loadingMunicipalityKeys.delete(key);
+      this._endLoading();
+      this._renderMarkers();
+    }
+  };
+
+  private _handleMapDblClick = (event: maplibregl.MapMouseEvent): void => {
+    if (!this._map?.getLayer('municipality-boundaries-fill')) {
+      return;
+    }
+
+    const feature = this._map.queryRenderedFeatures(event.point, {
+      layers: ['municipality-boundaries-fill'],
+    })[0];
+    if (!feature?.properties) return;
+
+    const properties = feature.properties as Record<string, unknown>;
+    const key = String(properties.AGS ?? '').trim();
+    if (!key) return;
+
+    if (!this._allMunicipalityKeys().includes(key)) {
+      return;
+    }
+
+    event.preventDefault();
+    this._removeMunicipalitySelection(key);
+  };
+
+  private _boundaryLayersExist(): boolean {
+    return Boolean(
+      this._map?.getLayer('municipality-boundaries-fill')
+      && this._map?.getLayer('municipality-boundaries-highlight')
+      && this._map?.getSource('municipality-boundaries')
+    );
+  }
+
+  private _municipalityBoundaryDataForMap(): FeatureCollection {
+    return {
+      type: 'FeatureCollection',
+      features: [...this._municipalityBoundaryData.features],
+    };
+  }
+
+  private _scheduleBoundaryLayerSetup(): void {
+    if (!this._map || this._boundarySetupScheduled) {
+      return;
+    }
+
+    if (this._boundaryLayersExist()) {
+      void this._loadMunicipalityBoundariesForVisibleStates();
+      return;
+    }
+
+    this._boundarySetupScheduled = true;
+
+    const schedule = () => {
+      if (!this._map) {
+        this._boundarySetupScheduled = false;
+        return;
+      }
+      if (this._map.isStyleLoaded()) {
+        void this._onMapStyleReady().finally(() => {
+          this._boundarySetupScheduled = false;
+        });
+        return;
+      }
+      this._map.once('styledata', schedule);
+    };
+
+    if (this._map.isStyleLoaded()) {
+      void this._onMapStyleReady().finally(() => {
+        this._boundarySetupScheduled = false;
+      });
+      return;
+    }
+
+    this._map.once('load', schedule);
+  }
+
+  private async _ensureBoundaryLayers(): Promise<void> {
+    if (!this._map?.isStyleLoaded()) {
+      return;
+    }
+
+    const countryBoundaries = await loadCountryBoundaries();
+    const stateBoundaries = await loadStateBoundaries();
+
+    if (!this._map.getSource('country-boundaries')) {
+      this._map.addSource('country-boundaries', {
+        type: 'geojson',
+        data: countryBoundaries,
+      });
+    }
+    if (!this._map.getSource('state-boundaries')) {
+      this._map.addSource('state-boundaries', {
+        type: 'geojson',
+        data: stateBoundaries,
+      });
+    }
+    const municipalityBoundaryData = this._municipalityBoundaryDataForMap();
+    if (!this._map.getSource('municipality-boundaries')) {
+      this._map.addSource('municipality-boundaries', {
+        type: 'geojson',
+        data: municipalityBoundaryData,
+      });
+    } else {
+      const municipalitySource = this._map.getSource('municipality-boundaries') as maplibregl.GeoJSONSource;
+      municipalitySource.setData(municipalityBoundaryData as unknown as object);
+    }
+
+    const existingLayers = this._map.getStyle().layers;
+    const beforeId = existingLayers && existingLayers.length > 0 ? existingLayers[0].id : undefined;
+
+    if (!this._map.getLayer('country-boundaries-line')) {
+      this._map.addLayer({
+        id: 'country-boundaries-line',
+        type: 'line',
+        source: 'country-boundaries',
+        paint: {
+          'line-color': '#9090ff',
+          'line-width': 2,
+        },
+      }, beforeId);
+    }
+
+    if (!this._map.getLayer('state-boundaries-fill')) {
+      this._map.addLayer({
+        id: 'state-boundaries-fill',
+        type: 'fill',
+        source: 'state-boundaries',
+        paint: {
+          'fill-color': 'rgba(0, 0, 0, 0)',
+          'fill-opacity': 0,
+        },
+      });
+    }
+    if (!this._map.getLayer('state-boundaries-line')) {
+      this._map.addLayer({
+        id: 'state-boundaries-line',
+        type: 'line',
+        source: 'state-boundaries',
+        minzoom: 4,
+        paint: {
+          'line-color': 'rgba(147, 197, 253, 0.35)',
+          'line-width': 1.2,
+        },
+      });
+    }
+
+    if (!this._map.getLayer('municipality-boundaries-fill')) {
+      this._map.addLayer({
+        id: 'municipality-boundaries-fill',
+        type: 'fill',
+        source: 'municipality-boundaries',
+        paint: {
+          'fill-color': 'rgba(0, 0, 0, 0)',
+          'fill-opacity': 0,
+        },
+      });
+    }
+    if (!this._map.getLayer('municipality-boundaries-highlight')) {
+      this._map.addLayer({
+        id: 'municipality-boundaries-highlight',
+        type: 'fill',
+        source: 'municipality-boundaries',
+        minzoom: 7,
+        paint: {
+          'fill-color': 'rgba(59, 130, 246, 0.32)',
+          'fill-opacity': 0.45,
+        },
+        filter: ['==', ['get', 'AGS'], '__none__'],
+      });
+    }
+    if (!this._map.getLayer('municipality-boundaries-line')) {
+      this._map.addLayer({
+        id: 'municipality-boundaries-line',
+        type: 'line',
+        source: 'municipality-boundaries',
+        minzoom: 7,
+        paint: {
+          'line-color': 'rgba(96, 165, 250, 0.22)',
+          'line-width': 0.8,
+        },
+      });
+    }
+
+    this._mapLayersReady = true;
+  }
+
+  private _resetBoundaryLayers(): void {
+    this._mapLayersReady = false;
+  }
+
+  private _onMapStyleReady(): Promise<void> {
+    if (!this._map) {
+      return Promise.resolve();
+    }
+
+    this._styleSetupPromise = this._styleSetupPromise.then(async () => {
+      this._resetBoundaryLayers();
+      try {
+        await this._ensureBoundaryLayers();
+        await this._loadMunicipalityBoundariesForVisibleStates();
+        if (!this._themeObserverBound) {
+          this._bindThemeObserver();
+        }
+        this._map?.once('idle', () => {
+          void this._loadMunicipalityBoundariesForVisibleStates();
+        });
+      } catch (error) {
+        console.error('Failed to set up map boundary layers:', error);
+      }
+    });
+
+    return this._styleSetupPromise;
+  }
+
+  private _bindMapStyleHandlers(): void {
+    if (!this._map) {
+      return;
+    }
+
+    this._map.on('load', () => {
+      this._scheduleBoundaryLayerSetup();
+    });
+
+    // MapLibre has no `style.load` event — recover custom layers after theme setStyle().
+    this._map.on('styledata', () => {
+      if (!this._map?.isStyleLoaded() || this._boundaryLayersExist()) {
+        return;
+      }
+      this._scheduleBoundaryLayerSetup();
+    });
+  }
+
+  private _bindMoveEndHandler(): void {
+    if (!this._map || this._moveEndHandlerBound) {
+      return;
+    }
+
+    this._map.on('moveend', () => {
+      void this._loadMunicipalityBoundariesForVisibleStates();
+      this._persistState();
+    });
+    this._moveEndHandlerBound = true;
+  }
+
+  private _bindThemeObserver(): void {
+    if (this._themeObserverBound) {
+      return;
+    }
+
+    this._themeMutationObserver = new MutationObserver(() => {
+      if (!this._map) {
+        return;
+      }
+
+      void resolveMapStyleForCurrentTheme().then((resolvedStyle) => {
+        if (!this._map || resolvedStyle === this._activeMapStyle) {
+          return;
+        }
+        this._activeMapStyle = resolvedStyle;
+        this._resetBoundaryLayers();
+        this._map!.setStyle(resolvedStyle);
+        this._map!.once('idle', () => {
+          this._scheduleBoundaryLayerSetup();
+        });
+      });
+    });
+    this._themeMutationObserver.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['class'],
+    });
+    this._themeObserverBound = true;
+  }
+
+  private _syncMunicipalitySourceToMap(): void {
+    if (!this._map?.getLayer('municipality-boundaries-fill')) {
+      return;
+    }
+
+    const municipalitySource = this._map.getSource('municipality-boundaries') as maplibregl.GeoJSONSource | undefined;
+    municipalitySource?.setData(this._municipalityBoundaryDataForMap() as unknown as object);
+    this._updateMunicipalityHighlights();
+    this._renderMarkers();
+  }
+
+  private async _loadMunicipalityBoundariesForVisibleStates(): Promise<void> {
+    if (!this._map) {
+      return;
+    }
+
+    const visibleStates = this._map.getLayer('state-boundaries-fill')
+      ? this._map.queryRenderedFeatures(undefined, { layers: ['state-boundaries-fill'] })
+      : [];
     const statesFromViewport = Array.from(new Set(
       visibleStates
         .map((feature) => String((feature.properties as Record<string, unknown> | undefined)?.SN_L ?? '').padStart(2, '0'))
@@ -790,6 +1086,7 @@ export class WattmonitorMapPart extends DocksPart {
     ])).filter((stateCode) => !this._loadedMunicipalityStates.has(stateCode));
 
     if (statesToLoad.length === 0) {
+      this._syncMunicipalitySourceToMap();
       return;
     }
 
@@ -806,10 +1103,7 @@ export class WattmonitorMapPart extends DocksPart {
       }
     }
 
-    const municipalitySource = this._map.getSource('municipality-boundaries') as maplibregl.GeoJSONSource | undefined;
-    municipalitySource?.setData(this._municipalityBoundaryData as unknown as object);
-    this._updateMunicipalityHighlights();
-    this._renderMarkers();
+    this._syncMunicipalitySourceToMap();
   }
 
   override async firstUpdated() {
@@ -859,219 +1153,21 @@ export class WattmonitorMapPart extends DocksPart {
       zoom: this._initialZoom,
       attributionControl: false,
     });
+    this._activeMapStyle = initialStyle;
+
+    this._bindMapStyleHandlers();
+    if (this._map.loaded()) {
+      this._scheduleBoundaryLayerSetup();
+    }
 
     this._map.addControl(new maplibregl.NavigationControl(), 'top-right');
     this._map.addControl(new maplibregl.ScaleControl({ unit: 'metric' }), 'bottom-left');
 
-    this._map.on('load', async () => {
-      // Add country boundaries layer (first layer)
-      try {
-        const countryBoundaries = await loadCountryBoundaries();
-        const stateBoundaries = await loadStateBoundaries();
-        this._map!.addSource('country-boundaries', {
-          type: 'geojson',
-          data: countryBoundaries,
-        });
-        this._map!.addSource('state-boundaries', {
-          type: 'geojson',
-          data: stateBoundaries,
-        });
-        this._map!.addSource('municipality-boundaries', {
-          type: 'geojson',
-          data: this._municipalityBoundaryData,
-        });
-        // Get the first existing layer to insert country boundaries before it
-        const existingLayers = this._map!.getStyle().layers;
-        const beforeId = existingLayers && existingLayers.length > 0 ? existingLayers[0].id : undefined;
+    this._bindMunicipalityInteractionHandlers();
+    this._bindMoveEndHandler();
 
-        // Add layers only after source is created, before all other layers
-
-        this._map!.addLayer({
-          id: 'country-boundaries-line',
-          type: 'line',
-          source: 'country-boundaries',
-          paint: {
-            'line-color': '#9090ff',
-            'line-width': 2,
-          },
-        }, beforeId);
-
-        this._map!.addLayer({
-          id: 'state-boundaries-fill',
-          type: 'fill',
-          source: 'state-boundaries',
-          paint: {
-            'fill-color': 'rgba(0, 0, 0, 0)',
-            'fill-opacity': 0,
-          },
-        });
-        this._map!.addLayer({
-          id: 'state-boundaries-line',
-          type: 'line',
-          source: 'state-boundaries',
-          minzoom: 4,
-          paint: {
-            'line-color': 'rgba(147, 197, 253, 0.35)',
-            'line-width': 1.2,
-          },
-        });
-
-        this._map!.addLayer({
-          id: 'municipality-boundaries-fill',
-          type: 'fill',
-          source: 'municipality-boundaries',
-          paint: {
-            'fill-color': 'rgba(0, 0, 0, 0)',
-            'fill-opacity': 0,
-          },
-        });
-        this._map!.addLayer({
-          id: 'municipality-boundaries-highlight',
-          type: 'fill',
-          source: 'municipality-boundaries',
-          minzoom: 7,
-          paint: {
-            'fill-color': 'rgba(59, 130, 246, 0.32)',
-            'fill-opacity': 0.45,
-          },
-          filter: ['==', ['get', 'AGS'], '__none__'],
-        });
-        this._map!.addLayer({
-          id: 'municipality-boundaries-line',
-          type: 'line',
-          source: 'municipality-boundaries',
-          minzoom: 7,
-          paint: {
-            'line-color': 'rgba(96, 165, 250, 0.22)',
-            'line-width': 0.8,
-          },
-        });
-
-        this._bindMunicipalityInteractionHandlers();
-        await this._loadMunicipalityBoundariesForVisibleStates();
-        this._updateMunicipalityHighlights();
-        this._map!.on('moveend', () => {
-          void this._loadMunicipalityBoundariesForVisibleStates();
-          this._persistState();
-        });
-      } catch (error) {
-        console.error('Failed to load country boundaries:', error);
-      }
-
-      // Set up theme change listener
-      this._themeMutationObserver = new MutationObserver(() => {
-        if (this._map) {
-          void resolveMapStyleForCurrentTheme().then((resolvedStyle) => {
-            this._map!.setStyle(resolvedStyle);
-            // Re-add layers after style change
-            setTimeout(async () => {
-            if (this._map && !this._map.getSource('country-boundaries')) {
-              try {
-                const countryBoundaries = await loadCountryBoundaries();
-                const stateBoundaries = await loadStateBoundaries();
-                this._map.addSource('country-boundaries', {
-                  type: 'geojson',
-                  data: countryBoundaries,
-                });
-                this._map.addSource('state-boundaries', {
-                  type: 'geojson',
-                  data: stateBoundaries,
-                });
-                this._map.addSource('municipality-boundaries', {
-                  type: 'geojson',
-                  data: this._municipalityBoundaryData,
-                });
-              } catch (error) {
-                console.error('Failed to load country boundaries:', error);
-              }
-              const existingLayers = this._map.getStyle().layers;
-              const beforeId = existingLayers && existingLayers.length > 0 ? existingLayers[0].id : undefined;
-
-              this._map.addLayer({
-                id: 'country-boundaries-fill',
-                type: 'fill',
-                source: 'country-boundaries',
-                paint: {
-                  'fill-color': 'rgba(0, 0, 0, 0)',
-                  'fill-opacity': 0,
-                },
-              }, beforeId);
-              this._map.addLayer({
-                id: 'country-boundaries-line',
-                type: 'line',
-                source: 'country-boundaries',
-                paint: {
-                  'line-color': 'rgba(128, 128, 128, 0.5)',
-                  'line-width': 1.5,
-                },
-              }, beforeId);
-
-              this._map.addLayer({
-                id: 'state-boundaries-fill',
-                type: 'fill',
-                source: 'state-boundaries',
-                paint: {
-                  'fill-color': 'rgba(0, 0, 0, 0)',
-                  'fill-opacity': 0,
-                },
-              });
-              this._map.addLayer({
-                id: 'state-boundaries-line',
-                type: 'line',
-                source: 'state-boundaries',
-                minzoom: 4,
-                paint: {
-                  'line-color': 'rgba(147, 197, 253, 0.35)',
-                  'line-width': 1.2,
-                },
-              });
-
-              this._map.addLayer({
-                id: 'municipality-boundaries-fill',
-                type: 'fill',
-                source: 'municipality-boundaries',
-                paint: {
-                  'fill-color': 'rgba(0, 0, 0, 0)',
-                  'fill-opacity': 0,
-                },
-              });
-              this._map.addLayer({
-                id: 'municipality-boundaries-highlight',
-                type: 'fill',
-                source: 'municipality-boundaries',
-                minzoom: 7,
-                paint: {
-                  'fill-color': 'rgba(59, 130, 246, 0.32)',
-                  'fill-opacity': 0.45,
-                },
-                filter: ['==', ['get', 'AGS'], '__none__'],
-              });
-              this._map.addLayer({
-                id: 'municipality-boundaries-line',
-                type: 'line',
-                source: 'municipality-boundaries',
-                minzoom: 7,
-                paint: {
-                  'line-color': 'rgba(96, 165, 250, 0.22)',
-                  'line-width': 0.8,
-                },
-              });
-
-              void this._loadMunicipalityBoundariesForVisibleStates();
-              this._updateMunicipalityHighlights();
-            }
-            }, 100);
-          });
-        }
-      });
-      this._themeMutationObserver.observe(document.documentElement, {
-        attributes: true,
-        attributeFilter: ['class'],
-      });
-
-      this._fetchAll();
-      this._refreshTimer = setInterval(() => this._fetchAll(), REFRESH_INTERVAL_MS);
-    });
+    this._fetchAll();
+    this._refreshTimer = setInterval(() => this._fetchAll(), REFRESH_INTERVAL_MS);
 
     this._resizeObserver = new ResizeObserver(() => this._map?.resize());
     this._resizeObserver.observe(container);
@@ -1141,10 +1237,28 @@ export class WattmonitorMapPart extends DocksPart {
     for (const municipalityKey of this._allMunicipalityKeys()) {
       const d = this._data.get(municipalityKey);
       const fetchError = this._fetchErrors.get(municipalityKey);
-      if (!d && !fetchError) continue;
+      const isLoading = this._loadingMunicipalityKeys.has(municipalityKey);
+      if (!d && !fetchError && !isLoading) continue;
       const position = this._resolveMunicipalityPosition(municipalityKey);
       if (!position) continue;
       const municipalityName = this._municipalityName(municipalityKey);
+
+      if (isLoading && !d) {
+        const el = document.createElement('div');
+        el.style.cssText = 'display:flex;flex-direction:column;align-items:center;filter:drop-shadow(0 2px 6px rgba(0,0,0,.35));background:var(--wa-color-surface-raised);padding:8px 6px;border-radius:8px;max-width:140px;border:2px solid var(--wa-color-brand-fill-loud);';
+        el.innerHTML = `
+          <div style="width:42px;height:42px;border-radius:50%;border:3px solid var(--wa-color-brand-fill-quiet);border-top-color:var(--wa-color-brand-fill-loud);animation:wmm-spin 0.8s linear infinite;"></div>
+          <div style="font-size:0.68rem;color:var(--wa-color-text-normal);margin-top:6px;text-align:center;font-weight:600;line-height:1.2;">${municipalityName}</div>
+          <div style="font-size:0.62rem;color:var(--wa-color-brand-fill-loud);margin-top:2px;font-weight:600;">Lädt…</div>
+          <style>@keyframes wmm-spin{to{transform:rotate(360deg)}}</style>`;
+
+        const marker = new maplibregl.Marker({ element: el, anchor: 'bottom' })
+          .setLngLat(position)
+          .addTo(this._map!);
+
+        this._markers.push(marker);
+        continue;
+      }
 
       if (!d) {
         const errorMessage = fetchError ?? 'Unbekannter Fehler';

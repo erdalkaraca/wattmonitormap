@@ -1,6 +1,6 @@
 import path, { dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { defineConfig } from 'vite';
+import { defineConfig, loadEnv } from 'vite';
 import { createDocksPwaPlugin } from '@eclipse-docks/extension-pwa/vite';
 import crossOriginIsolation from 'vite-plugin-cross-origin-isolation';
 import mkcert from 'vite-plugin-mkcert';
@@ -9,21 +9,17 @@ import { resolveDepVersionsPlugin } from '@eclipse-docks/core/vite-plugin-resolv
 import { localAliasesPlugin } from '@eclipse-docks/core/vite-plugin-local-aliases';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
-const basePath = process.env.VITE_BASE_PATH || '/';
 
-export default defineConfig({
+export default defineConfig(({ mode }) => {
+  const env = loadEnv(mode, __dirname, '');
+  const basePath = env.VITE_BASE_PATH || '/';
+
+  return {
   root: __dirname,
   base: basePath,
   resolve: {},
   server: {
     host: '0.0.0.0',
-    proxy: {
-      '/api': {
-        target: 'https://wattmonitor.ewe-netz.de',
-        changeOrigin: true,
-        secure: true,
-      },
-    },
     watch: {
       ignored: ['**/node_modules/**', '**/dist/**'],
     },
@@ -61,4 +57,5 @@ export default defineConfig({
       },
     },
   },
+};
 });
