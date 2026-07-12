@@ -17,6 +17,13 @@ export default defineConfig({
   resolve: {},
   server: {
     host: '0.0.0.0',
+    proxy: {
+      '/api': {
+        target: 'https://wattmonitor.ewe-netz.de',
+        changeOrigin: true,
+        secure: true,
+      },
+    },
     watch: {
       ignored: ['**/node_modules/**', '**/dist/**'],
     },

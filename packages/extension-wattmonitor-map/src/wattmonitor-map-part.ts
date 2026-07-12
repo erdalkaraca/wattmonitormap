@@ -36,10 +36,9 @@ export interface WattMonitorDataPoint {
   Niederschlag: number;
 }
 
-// NOTE: The WattMonitor backend does not send CORS headers for external origins.
-// Mock data is used until the operator enables cross-origin access.
-// Toggle USE_MOCK_DATA in map-status.ts to switch to live data.
-const API_BASE = 'https://wattmonitor.ewe-netz.de';
+// In local dev, `/api` is proxied by Vite to avoid browser CORS restrictions.
+// In preview/production builds, call the backend directly (requires backend CORS).
+const API_BASE = import.meta.env.DEV ? '' : 'https://wattmonitor.ewe-netz.de';
 const REFRESH_INTERVAL_MS = 15 * 60 * 1000; // 15 min
 
 const STATE_CODES = [
