@@ -6,7 +6,7 @@ import maplibreCss from 'maplibre-gl/dist/maplibre-gl.css?inline';
 
 maplibregl.setWorkerUrl(maplibreWorkerUrl);
 import { DEFAULT_MUNICIPALITY_KEYS } from './municipalities.js';
-import { RELOAD_REQUEST_EVENT, USE_MOCK_DATA, loadingSignal, lastUpdateSignal, errorCountSignal } from './map-status.js';
+import { RELOAD_REQUEST_EVENT, loadingSignal, lastUpdateSignal, errorCountSignal } from './map-status.js';
 import countryBoundariesUrl from './countries.geojson?url';
 import stateBoundariesUrl from './state-boundaries.geojson?url';
 
@@ -165,59 +165,6 @@ async function resolveMapStyleForCurrentTheme(): Promise<string | object> {
 }
 
 
-
-/** Deterministic mock data generator – varies per municipality key so markers get different colours. */
-function generateMockData(key: string): WattMonitorDataPoint {
-  // Improved seed: multiply by larger factors and square to increase variance
-  const seed = key.split('').reduce((acc, c, i) => (acc * 31 + c.charCodeAt(0)) * (i + 1), 5381);
-  const rng = (min: number, max: number, offset = 0) => {
-    // Use multiple trigonometric functions with different phases to maximize variance
-    const angle = (seed + offset) * 0.01;
-    const v = Math.abs(Math.sin(angle) * Math.cos(angle * 1.7) * Math.tan(angle * 0.5 + 1)) * 10_000;
-    return min + (v % (max - min));
-  };
-
-  const windPct  = Math.round(rng(5, 60, 1));     // Higher variance
-  const pvPct    = Math.round(rng(10, 80, 2));    // Higher variance
-  const biomPct  = Math.round(rng(0, 20, 3));
-  const waterPct = Math.round(rng(0, 10, 4));     // Higher variance
-  const total    = windPct + pvPct + biomPct + waterPct;
-  const scale    = 100 / (total || 100);
-
-  const erzSumme = Math.round(rng(1_000_000, 30_000_000, 5));
-  const vrbSumme = Math.round(rng(3_000_000, 30_000_000, 6));
-  const gwPct    = Math.round(rng(50, 80, 7));
-  const privPct  = Math.round(rng(15, 35, 8));
-  const komPct   = 100 - gwPct - privPct;
-
-  return {
-    Gemeindeschluessel: key,
-    Zeitpunkt: new Date().toISOString(),
-    ErzeugungSumme: erzSumme,
-    VerbrauchSumme: vrbSumme,
-    ErzeugungWindProzent:     Math.round(windPct  * scale),
-    ErzeugungPvProzent:       Math.round(pvPct    * scale),
-    ErzeugungBiomasseProzent: Math.round(biomPct  * scale),
-    ErzeugungWasserProzent:   Math.round(waterPct * scale),
-    ErzeugungSonstigeProzent: 0,
-    ErzeugungWind:    Math.round(erzSumme * windPct  * scale / 100),
-    ErzeugungPv:      Math.round(erzSumme * pvPct    * scale / 100),
-    ErzeugungBiomasse:Math.round(erzSumme * biomPct  * scale / 100),
-    ErzeugungWasser:  Math.round(erzSumme * waterPct * scale / 100),
-    ErzeugungSonstige: 0,
-    VerbrauchGewerbeProzent: gwPct,
-    VerbrauchPrivatProzent:  privPct,
-    VerbrauchKommuneProzent: komPct,
-    VerbrauchGewerbe: Math.round(vrbSumme * gwPct   / 100),
-    VerbrauchPrivat:  Math.round(vrbSumme * privPct / 100),
-    VerbrauchKommune: Math.round(vrbSumme * komPct  / 100),
-    Windrichtung:  Math.round(rng(0, 360, 9)),
-    Windstaerke:   Math.round(rng(0, 8, 10) * 10) / 10,
-    Temperatur:    Math.round(rng(8, 28, 11) * 10) / 10,
-    Bedeckungsgrad:Math.round(rng(0, 100, 12)),
-    Niederschlag:  0,
-  };
-}
 
 function coverageColor(ratio: number): string {
   const isDark = document.documentElement.classList.contains('wa-dark');
@@ -771,7 +718,7 @@ export class WattmonitorMapPart extends DocksPart {
     this._renderMarkers();
 
     try {
-      await this._fetchOne(key);
+      await this._fetchBatch([key]);
     } catch (error) {
       console.error(`Failed to load municipality data for ${key}:`, error);
     } finally {
@@ -1191,10 +1138,10 @@ export class WattmonitorMapPart extends DocksPart {
   private async _fetchAll(): Promise<void> {
     this._beginLoading();
     try {
-      const results = await Promise.allSettled(
-        this._allMunicipalityKeys().map((municipalityKey) => this._fetchOne(municipalityKey))
-      );
-      errorCountSignal.set(results.filter(r => r.status === 'rejected').length);
+      const keys = this._allMunicipalityKeys();
+      await this._fetchBatch(keys).catch(() => { /* errors stored per-key */ });
+      const keySet = new Set(keys);
+      errorCountSignal.set([...this._fetchErrors.keys()].filter((k) => keySet.has(k)).length);
       lastUpdateSignal.set(new Date());
       this._renderMarkers();
     } finally {
@@ -1202,28 +1149,34 @@ export class WattmonitorMapPart extends DocksPart {
     }
   }
 
-  private async _fetchOne(municipalityKey: string): Promise<void> {
-    if (USE_MOCK_DATA) {
-      await new Promise(r => setTimeout(r, 50));
-      this._data.set(municipalityKey, generateMockData(municipalityKey));
-      this._fetchErrors.delete(municipalityKey);
-      return;
-    }
+  private async _fetchBatch(keys: string[]): Promise<void> {
+    if (keys.length === 0) return;
     try {
       const res = await fetch(`${API_BASE}/api/getdata`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(municipalityKey),
+        body: JSON.stringify(keys.join(',')),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: WattMonitorDataPoint[] = await res.json();
-      if (!Array.isArray(data) || data.length === 0) throw new Error('empty response');
-      this._data.set(municipalityKey, data[0]);
-      this._fetchErrors.delete(municipalityKey);
+      if (!Array.isArray(data)) throw new Error('invalid response');
+      const byKey = new Map(data.map((d) => [d.Gemeindeschluessel, d]));
+      for (const key of keys) {
+        const point = byKey.get(key);
+        if (point) {
+          this._data.set(key, point);
+          this._fetchErrors.delete(key);
+        } else {
+          this._data.delete(key);
+          this._fetchErrors.set(key, 'Keine Daten verfügbar');
+        }
+      }
     } catch (error) {
-      this._data.delete(municipalityKey);
       const message = error instanceof Error ? error.message : String(error);
-      this._fetchErrors.set(municipalityKey, message);
+      for (const key of keys) {
+        this._data.delete(key);
+        this._fetchErrors.set(key, message);
+      }
       throw error;
     }
   }

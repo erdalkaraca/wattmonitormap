@@ -1,8 +1,5 @@
 import { signal } from '@eclipse-docks/core/externals/lit';
 
-/** Mock mode fallback when the API is unavailable. */
-export const USE_MOCK_DATA = false;
-
 export const RELOAD_REQUEST_EVENT = 'wattmonitor:reload-request';
 
 export const loadingSignal    = signal(true);

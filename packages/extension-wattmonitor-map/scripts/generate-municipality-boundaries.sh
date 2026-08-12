@@ -2,6 +2,8 @@
 set -euo pipefail
 
 # Rebuilds municipality boundary assets from official BKG VG250 data.
+# Attribution and license notes for the source dataset are documented in
+# ../BKG_VG250_ATTRIBUTION.md and must be preserved when shipping derived assets.
 #
 # Usage:
 #   npm run generate:municipality-boundaries -w extension-wattmonitor-map

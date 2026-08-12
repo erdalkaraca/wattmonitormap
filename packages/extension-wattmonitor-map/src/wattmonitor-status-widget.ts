@@ -1,6 +1,6 @@
 import { customElement, html } from '@eclipse-docks/core/externals/lit';
 import { DocksElement, DocksWidget } from '@eclipse-docks/core';
-import { RELOAD_REQUEST_EVENT, USE_MOCK_DATA, loadingSignal, lastUpdateSignal, errorCountSignal } from './map-status.js';
+import { RELOAD_REQUEST_EVENT, loadingSignal, lastUpdateSignal, errorCountSignal } from './map-status.js';
 
 @customElement('wattmonitor-status-widget')
 export class WattmonitorStatusWidget extends DocksElement {
@@ -47,7 +47,6 @@ export class WattmonitorStatusWidget extends DocksElement {
         </wa-button>
         <style>@keyframes wmm-refresh-spin{to{transform:rotate(360deg)}}</style>
         <span style="color:var(--wa-color-text-quiet);white-space:nowrap;">Stand: ${ts}</span>
-        ${USE_MOCK_DATA ? html`<span style="color:var(--wa-color-brand-fill-loud);font-weight:600;white-space:nowrap;">[Mock]</span>` : ''}
       </div>
     `;
   }

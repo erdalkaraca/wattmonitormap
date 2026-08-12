@@ -1,9 +1,12 @@
-import { contributionRegistry, SYSTEM_LAYOUTS, TOOLBAR_BOTTOM, TOOLBAR_BOTTOM_CENTER, TOOLBAR_BOTTOM_END } from '@eclipse-docks/core';
+import { contributionRegistry, SYSTEM_LAYOUTS, TOOLBAR_BOTTOM, TOOLBAR_BOTTOM_END } from '@eclipse-docks/core';
 import type { LayoutContribution, HTMLContribution } from '@eclipse-docks/core';
 import './wattmonitor-map-layout.js';
 import './wattmonitor-legend-widget.js';
-import './wattmonitor-attribution-widget.js';
 import './wattmonitor-status-widget.js';
+
+// Compatibility shim until Docks exports the upstream About attribution target and type.
+const ABOUT_ATTRIBUTIONS = 'about.attributions';
+type AboutAttributionContribution = HTMLContribution;
 
 contributionRegistry.registerContribution(SYSTEM_LAYOUTS, {
   id: 'wattmonitor-map',
@@ -19,11 +22,24 @@ contributionRegistry.registerContribution(TOOLBAR_BOTTOM, {
   component: '<wattmonitor-status-widget></wattmonitor-status-widget>',
 } as HTMLContribution);
 
-contributionRegistry.registerContribution(TOOLBAR_BOTTOM_CENTER, {
-  label: 'Map Attribution',
-  name: 'wattmonitor.attribution',
-  slot: 'start',
-  component: '<wattmonitor-attribution-widget></wattmonitor-attribution-widget>',
-} as HTMLContribution);
+contributionRegistry.registerContribution(ABOUT_ATTRIBUTIONS, {
+  label: 'basemap.de',
+  name: 'wattmonitor.about-attribution.basemapde',
+  component: `
+    <span>
+      Base map tiles and map service attribution: <a href="https://basemap.de" target="_blank" rel="noopener noreferrer">basemap.de</a>
+    </span>
+  `,
+} as AboutAttributionContribution);
+
+contributionRegistry.registerContribution(ABOUT_ATTRIBUTIONS, {
+  label: 'BKG VG250',
+  name: 'wattmonitor.about-attribution.vg250',
+  component: `
+    <span>
+      Municipality and state boundaries derived from <a href="https://gdz.bkg.bund.de/index.php/default/digitale-geodaten/verwaltungsgebiete/verwaltungsgebiete-1-250-000-stand-31-12-vg250-31-12.html" target="_blank" rel="noopener noreferrer">BKG VG250 31.12</a>, licensed under <a href="https://www.govdata.de/dl-de/by-2-0" target="_blank" rel="noopener noreferrer">dl-de/by-2-0</a>; data modified.
+    </span>
+  `,
+} as AboutAttributionContribution);
 
 export default function wattmonitorMapLoader() {}
