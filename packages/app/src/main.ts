@@ -1,4 +1,5 @@
 import { appLoaderService, contributionRegistry, type HTMLContribution, TOOLBAR_MAIN, TOOLBAR_LAYOUT_SWITCHER, TOOLBAR_LANGUAGE_SELECTOR, TOOLBAR_ACTIVE_PART_NAME } from '@eclipse-docks/core';
+import { fetchReleases } from '@eclipse-docks/extension-github-service';
 
 const logoUrl = `${import.meta.env.BASE_URL}logo-loading.svg`;
 
@@ -14,7 +15,10 @@ appLoaderService.registerApp(
   {
     layout: 'wattmonitor-map',
     name: 'WattMonitor Map',
-    description: 'WattMonitor Map – Application built with Eclipse Docks.',
+    description: 'Interactive map showing live wind and solar power generation across northwest Germany.',
+    metadata: {
+      github: { owner: 'erdalkaraca', repo: 'wattmonitormap' },
+    },
     remaps: [
       // Hide the layout switcher – this app always uses the map layout.
       { name: TOOLBAR_LAYOUT_SWITCHER, targets: [] },
@@ -27,6 +31,7 @@ appLoaderService.registerApp(
       '@eclipse-docks/extension-pwa',
       'extension-wattmonitor-map',
     ],
+    releaseHistory: fetchReleases,
   },
   { autoStart: true, hostConfig: true, container: appRoot },
 );

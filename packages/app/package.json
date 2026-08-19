@@ -15,6 +15,7 @@
   "dependencies": {
     "@eclipse-docks/core": "^0.x",
     "@eclipse-docks/extension-pwa": "^0.x",
+    "@eclipse-docks/extension-github-service": "^0.x",
     "extension-wattmonitor-map": "*"
   },
   "devDependencies": {
