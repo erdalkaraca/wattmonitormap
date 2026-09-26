@@ -1,15 +1,7 @@
-import type { HTMLContribution, LayoutContribution } from '@eclipse-docks/core';
-import { contributionRegistry, SYSTEM_ATTRIBUTIONS, SYSTEM_LAYOUTS, TOOLBAR_BOTTOM } from '@eclipse-docks/core';
+import type { HTMLContribution } from '@eclipse-docks/core';
+import { contributionRegistry, SYSTEM_ATTRIBUTIONS, TOOLBAR_BOTTOM } from '@eclipse-docks/core';
 import './wattmonitor-legend-widget.js';
-import './wattmonitor-map-layout.js';
 import './wattmonitor-status-widget.js';
-
-contributionRegistry.registerContribution(SYSTEM_LAYOUTS, {
-  id: 'wattmonitor-map',
-  name: 'WattMonitor Karte',
-  icon: 'map',
-  component: { tag: 'wattmonitor-map-layout' },
-} as LayoutContribution);
 
 contributionRegistry.registerContribution(TOOLBAR_BOTTOM, {
   label: 'WattMonitor Status',
