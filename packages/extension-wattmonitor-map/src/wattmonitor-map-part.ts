@@ -1151,32 +1151,38 @@ export class WattmonitorMapPart extends DocksPart {
 
   private async _fetchBatch(keys: string[]): Promise<void> {
     if (keys.length === 0) return;
+
+    const results = await Promise.allSettled(keys.map((key) => this._fetchMunicipality(key)));
+    if (results.some((result) => result.status === 'rejected')) {
+      throw new Error('municipality data request failed');
+    }
+  }
+
+  private async _fetchMunicipality(key: string): Promise<void> {
     try {
       const res = await fetch(`${API_BASE}/api/getdata`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(keys.join(',')),
+        body: JSON.stringify({ municipalityKey: key }),
       });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
       const data: WattMonitorDataPoint[] = await res.json();
       if (!Array.isArray(data)) throw new Error('invalid response');
-      const byKey = new Map(data.map((d) => [d.Gemeindeschluessel, d]));
-      for (const key of keys) {
-        const point = byKey.get(key);
-        if (point) {
-          this._data.set(key, point);
-          this._fetchErrors.delete(key);
-        } else {
-          this._data.delete(key);
-          this._fetchErrors.set(key, 'Keine Daten verfügbar');
-        }
+
+      const point = data.find((entry) => entry.Gemeindeschluessel === key);
+      if (!point) {
+        this._data.delete(key);
+        this._fetchErrors.set(key, 'Keine Daten verfügbar');
+        return;
       }
+
+      this._data.set(key, point);
+      this._fetchErrors.delete(key);
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
-      for (const key of keys) {
-        this._data.delete(key);
-        this._fetchErrors.set(key, message);
-      }
+      this._data.delete(key);
+      this._fetchErrors.set(key, message);
       throw error;
     }
   }
